@@ -18,6 +18,7 @@ from PIL import Image
 
 from tiresias.agent.controller import TaskController
 from tiresias.agent.feedback import CallFeedback
+from tiresias.agent.conversation_controls import clean_request,language_command,localize,LANGUAGES
 from tiresias.agent.intent import IntentClassifier
 from tiresias.agent.media import CALLER_AUDIO_TRACK, CALLER_VIDEO_TRACK, FrameBuffer, IncomingFrame
 from tiresias.agent.speech import CallLifecycle, SpeechScheduler
@@ -37,7 +38,9 @@ load_dotenv(".env")
 logger = logging.getLogger("tiresias.agent")
 settings = Settings()
 AGENT_NAME = os.environ.get("AGENT_NAME", settings.agent_name)
-server = AgentServer()
+server = AgentServer(num_idle_processes=int(os.environ.get('AGENT_NUM_IDLE_PROCESSES','1')),
+                    host=os.environ.get('AGENT_HOST','127.0.0.1'),
+                    port=int(os.environ.get('AGENT_PORT','8081')))
 _VAD = silero.VAD.load()
 
 
@@ -183,6 +186,7 @@ async def entrypoint(ctx: JobContext) -> None:
     subscribed_video: set[str] = set()
     video_tasks: set[asyncio.Task] = set()
     voice_state={'preferences':VoicePreferences(), 'user_id':None, 'attempts':0, 'closed':False}
+    language_state={'code':'en'}
     voice_state.update(manual_profile=False,auto_user_id=None,setup_code=None,selection_revision=0)
     profile_entry=ProfileCodeEntry()
     caller_task=None
@@ -211,7 +215,7 @@ async def entrypoint(ctx: JobContext) -> None:
             api_key=key,
             language_code="en",
             secondary_languages=["ru"],
-            include_language_detection=True,
+            include_language_detection=False,
             server_vad={"vad_silence_threshold_secs": 0.6, "vad_threshold": 0.5},
         ),
         tts=elevenlabs.TTS(
@@ -220,6 +224,7 @@ async def entrypoint(ctx: JobContext) -> None:
             api_key=key,
             voice_settings=VoiceSettings(**voice_state['preferences'].tts_options()),
             apply_text_normalization="on",
+            language='en',
         ),
         vad=_VAD,
         turn_handling={
@@ -235,6 +240,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def speak(text: str, *, interruptible: bool = False, private: bool = False,
                     status_cue: bool = False, answer: bool = False) -> None:
+        text=localize(text,language_state['code'])
         started=None
         try:
             if not status_cue:
@@ -258,7 +264,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async def say_status(text):
         await speak(text,status_cue=True)
 
-    feedback=CallFeedback(quiet,say_status)
+    feedback=CallFeedback(quiet,say_status,cue_interval=8)
 
     def submit_turn(work, *, cue=None, delay=1.5):
         token=feedback.begin_work()
@@ -419,10 +425,11 @@ async def entrypoint(ctx: JobContext) -> None:
             if vision is None:
                 raise RuntimeError('vision is not configured')
             if hasattr(vision,'stream_answer_question'):
-                stream=vision.stream_answer_question(frame,question,history)
+                stream=vision.stream_answer_question(frame,question,history,language=LANGUAGES[language_state['code']])
                 reply=await asyncio.wait_for(anext(stream),settings.vision_timeout_seconds)
             else:
-                reply=await asyncio.wait_for(asyncio.to_thread(vision.answer_question,frame,question,history),settings.vision_timeout_seconds)
+                reply=await asyncio.wait_for(asyncio.to_thread(vision.answer_question,frame,question,history,
+                    language=LANGUAGES[language_state['code']]),settings.vision_timeout_seconds)
             logger.info('conversational speech ready elapsed_ms=%d frame=%s',(time.monotonic()-started)*1000,
                         f'{frame.width}x{frame.height}' if frame else 'none')
             measure('conversation',started)
@@ -487,6 +494,13 @@ async def entrypoint(ctx: JobContext) -> None:
         cleaned = text.strip()
         if not cleaned or voice_state['closed']:
             return
+        requested_language=language_command(cleaned)
+        command=None if requested_language else profile_entry.consume(cleaned)
+        if requested_language is None and command is None:
+            cleaned=clean_request(cleaned,busy=feedback.busy or feedback.agent_speaking)
+            if cleaned is None:
+                logger.debug('Ignored non-request speech fragment')
+                return
         # Open listening as soon as audio exists so commands are not dropped
         # while waiting for chert_bridge_ready metadata.
         lifecycle.on_caller_audio(epoch)
@@ -494,11 +508,18 @@ async def entrypoint(ctx: JobContext) -> None:
             return
         feedback.connect()
         logger.info("user transcript: %s", cleaned[:120])
+        if requested_language is not None:
+            async def change_language():
+                await session.interrupt(force=True)
+                language_state['code']=requested_language
+                session.tts.update_options(language=requested_language)
+                await speak('Speaking English.' if requested_language=='en' else 'Хорошо, буду говорить по-русски.')
+            submit_turn(change_language())
+            return
         if cleaned.lower().strip(' .!?') in {'repeat setup code','repeat the setup code'} and voice_state['setup_code']:
             submit_turn(announce_setup_code(voice_state['setup_code']))
             return
         classifier = _get_intent_classifier()
-        command=profile_entry.consume(cleaned)
         if command is not None:
             response_audio_clock['started']=None
             async def change_voice():
@@ -523,7 +544,6 @@ async def entrypoint(ctx: JobContext) -> None:
         response_audio_clock['ready']=False
         conversation_history.append({"role": "user", "text": cleaned})
         del conversation_history[:-6]
-        was_active=feedback.busy or feedback.agent_speaking
 
         async def route_and_act() -> None:
             intent = immediate
@@ -531,8 +551,7 @@ async def entrypoint(ctx: JobContext) -> None:
             if intent.kind != IntentKind.SOCIAL:
                 await session.interrupt(force=True)
             if intent.kind == IntentKind.CONVERSATION:
-                feedback.queue_cue('Got it.' if was_active else 'Taking a look.',
-                                   token=work_token,delay=0 if was_active else 1.5)
+                feedback.queue_cue('Taking a look.',token=work_token,delay=2.5)
             if intent.kind == IntentKind.SOCIAL:
                 greeting = cleaned.lower().strip(' .!?') in {"hello", "hi", "hey", "привет"}
                 await speak("I'm here. What would you like me to look at?" if greeting else "Okay. What would you like to know?")

@@ -166,7 +166,7 @@ async def test_conversational_answer_waits_for_caller_silence(monkeypatch):
     from tiresias.contracts import GroundedReply
     called = threading.Event()
 
-    def answer(frame, question, history):
+    def answer(frame, question, history, **kwargs):
         assert question == 'How many Pepsi cans can you see?'
         called.set()
         return GroundedReply(text='I see two Pepsi cans.', frame_id=frame.frame_id)
@@ -285,7 +285,7 @@ async def test_setup_digits_are_excluded_from_logs_and_vision_history(monkeypatc
     import logging
     caplog.set_level(logging.INFO,logger='tiresias.agent')
     history=[]
-    def answer(frame,question,recent):
+    def answer(frame,question,recent,**kwargs):
         history.extend(recent)
         return GroundedReply(text='I see a label.',frame_id=frame.frame_id)
     caller=SimpleNamespace(call_id='80498626-b341-469d-9375-8b941a92663d',handle='+12145550100')
@@ -371,7 +371,7 @@ async def test_video_processing_does_not_block_loop_or_refresh_capture_timestamp
 async def test_streamed_conversation_starts_before_trailing_metadata(monkeypatch):
     from tiresias.contracts import GroundedReply
     finish=asyncio.Event()
-    async def stream(frame,question,history):
+    async def stream(frame,question,history,**kwargs):
         yield GroundedReply(text='Two Pepsi cans.',frame_id=frame.frame_id)
         await finish.wait()
     session,frames=await setup_call(monkeypatch,SimpleNamespace(stream_answer_question=stream))
@@ -389,7 +389,7 @@ async def test_turn_to_audio_metric_waits_for_actual_speaking_state(monkeypatch)
     metrics=[]
     async def nothing(): pass
     monkeypatch.setattr(runtime,'TelemetrySink',lambda url:SimpleNamespace(start=lambda:None,emit=lambda **event:metrics.append(event),close=nothing))
-    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=lambda *args:GroundedReply(text='Two cans.')))
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=lambda *args,**kwargs:GroundedReply(text='Two cans.')))
     push(frames)
     await session.transcript('How many Pepsi cans can you see?')
     await asyncio.wait_for(session.messages.get(),1)
@@ -448,7 +448,7 @@ async def test_video_queue_wait_does_not_make_an_old_frame_fresh(monkeypatch):
 @pytest.mark.asyncio
 async def test_backchannel_finalized_just_after_fast_answer_does_not_prompt_again(monkeypatch):
     from tiresias.contracts import GroundedReply
-    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=lambda *args:GroundedReply(text='Two Pepsi cans.')))
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=lambda *args,**kwargs:GroundedReply(text='Two Pepsi cans.')))
     push(frames)
     await session.transcript('How many Pepsi cans can you see?')
     assert await asyncio.wait_for(session.messages.get(),1)=='Two Pepsi cans.'
@@ -459,7 +459,7 @@ async def test_backchannel_finalized_just_after_fast_answer_does_not_prompt_agai
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('text',['Stop.','Wait.','Hold on.'])
+@pytest.mark.parametrize('text',['Stop.','Wait.','Hold on.','Стоп.','Подожди.'])
 async def test_pause_controls_confirm_listening_without_a_vision_request(monkeypatch,text):
     session,frames=await setup_call(monkeypatch,None)
     await session.transcript(text)
@@ -470,7 +470,7 @@ async def test_pause_controls_confirm_listening_without_a_vision_request(monkeyp
 async def test_interrupting_a_pending_visual_question_gets_one_brief_ack(monkeypatch):
     from tiresias.contracts import GroundedReply
     started,release=threading.Event(),threading.Event()
-    def answer(frame,question,history):
+    def answer(frame,question,history,**kwargs):
         if 'Pepsi' in question:
             started.set()
             assert release.wait(3)
@@ -601,3 +601,43 @@ async def test_bridge_transport_failure_shuts_down_sdk_without_draining_audio(mo
     session.room.handlers['participant_disconnected'](
         SimpleNamespace(identity='chert-bridge-test',disconnect_reason='CONNECTION_TIMEOUT'))
     assert session.shutdown_calls==[False]
+
+
+@pytest.mark.asyncio
+async def test_noise_does_not_interrupt_or_acknowledge_pending_answer(monkeypatch):
+    from tiresias.contracts import GroundedReply
+    started,release=threading.Event(),threading.Event()
+    calls=[]
+    def answer(frame,question,history,**kwargs):
+        calls.append(question);started.set();release.wait(3)
+        return GroundedReply(text='Two Pepsi cans.')
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=answer))
+    push(frames)
+    await session.transcript('How many Pepsi cans can you see?')
+    assert await asyncio.to_thread(started.wait,1)
+    try:
+        for noise in ['А-а-а...','Um, um-','Я га-','Ага.','Да, да, я вижу.']:
+            await session.transcript(noise)
+        await asyncio.sleep(0.25)
+        assert session.interruptions==1
+        assert session.messages.empty()
+        assert len(calls)==1
+    finally: release.set()
+    assert await asyncio.wait_for(session.messages.get(),1)=='Two Pepsi cans.'
+
+
+@pytest.mark.asyncio
+async def test_response_language_changes_only_on_explicit_command(monkeypatch):
+    from tiresias.contracts import GroundedReply
+    languages=[]
+    def answer(frame,question,history,*,language='English'):
+        languages.append(language)
+        return GroundedReply(text='Two cans.' if language=='English' else 'Две банки.')
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=answer))
+    for question,expected in [('Что ты видишь?','Two cans.'),('Speak Russian.',None),
+                              ('How many Pepsi cans can you see?','Две банки.'),('Switch to English.',None),
+                              ('Что ты видишь?','Two cans.')]:
+        push(frames);await session.transcript(question)
+        response=await asyncio.wait_for(session.messages.get(),1)
+        if expected: assert response==expected
+    assert languages==['English','Russian','English']

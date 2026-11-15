@@ -31,6 +31,18 @@ def test_provider_failure_is_not_an_image_quality_observation():
         client(error=RuntimeError('provider offline')).analyze_frame(frame(), None)
 
 
+def test_foreign_question_does_not_choose_response_language():
+    captured=[]
+    vision=client()
+    def generate(**kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(text='{"text":"Two cans.","needs_view":false}')
+    vision._client.models.generate_content=generate
+    vision.answer_question(None,'Что ты видишь?',[],language='English')
+    assert 'English' in captured[0]['config'].system_instruction
+    assert 'language of their question' not in str(captured[0]['contents'])
+
+
 def test_truncated_json_is_not_an_image_quality_observation():
     with pytest.raises(ValueError):
         client(response='{"visible_text":[').analyze_frame(frame(), None)

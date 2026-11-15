@@ -1,8 +1,9 @@
 # Vultr web deployment
 
-The Vultr VM runs FastAPI, Caddy and systemd. The FaceTime bridge and LiveKit
-worker remain on the operator's computer. Both use the same hosted Tiger Data
-database, so saved voices and aggregate call telemetry are shared.
+The Vultr VM runs FastAPI, Caddy and systemd. The separate call worker and Chert
+connector also run on this VM; see [Persistent cloud calling](CALL-HOSTING.md).
+All services use the same hosted Tiger Data database, so saved voices and
+aggregate call telemetry are shared. This document covers the web deployment.
 
 From the repository root, using a private SSH key registered on the VM and a
 previously verified `data/deploy/known_hosts`:

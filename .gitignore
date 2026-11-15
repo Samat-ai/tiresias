@@ -42,3 +42,14 @@ temp/
 docs/trial-results.json
 docs/provider-capabilities.private.md
 .playwright-mcp/
+
+# Local planning, IDE and agent workspace files
+docs/
+.idea/
+.vscode/
+.codex/
+.agents/
+.claude/
+.cursor/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,35 @@
+[Unit]
+Description=Tiresias Chert cloud FaceTime connector
+After=network-online.target tiresias-agent.service
+Wants=network-online.target tiresias-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tiresias-call
+Group=tiresias-call
+WorkingDirectory=/var/lib/tiresias-call
+Environment=HOME=/var/lib/tiresias-call
+Environment=CHERT_HOME=/var/lib/tiresias-call/.chert
+Environment=PATH=/opt/tiresias/runtime/node/bin:/usr/bin:/bin
+Environment=CHERT_TAKEOVER=
+EnvironmentFile=/etc/tiresias-call/chert.env
+ExecStart=/opt/tiresias/runtime/node/bin/node /opt/tiresias/chert/node_modules/@trychert/facetime/dist/src/cli/main.js dev --agent tiresias-agent --project 8fdd4e9f-a087-4269-89d1-8ee7fbfe6ba2 --env-file /etc/tiresias-call/chert.env --json $CHERT_TAKEOVER
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillSignal=SIGINT
+UMask=0077
+StateDirectory=tiresias-call
+StateDirectoryMode=0700
+MemoryHigh=200M
+MemoryMax=350M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tiresias-call
+
+[Install]
+WantedBy=multi-user.target

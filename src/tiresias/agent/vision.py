@@ -85,11 +85,11 @@ class VisionClient:
             observation = observation.model_copy(update={"frame_id": frame.frame_id})
         return _soften_quality(observation)
 
-    def answer_question(self, frame: FrameRef | None, question: str, history: list[dict]) -> GroundedReply:
+    def answer_question(self, frame: FrameRef | None, question: str, history: list[dict], *, language: str = 'English') -> GroundedReply:
         prompt = (
             "You are Tiresias, a helpful visual assistant in a live FaceTime conversation. "
             "Answer the caller's actual question directly, warmly, in one or two short sentences, "
-            "at most 45 words. Reply in the language of their question. "
+            f"at most 45 words. Reply only in {language}. "
             "For counts, count only the requested visible objects; if uncertain, say so. "
             "Describe object locations as left/right/center in the image when useful. "
             "Quote readable label words. Never invent unreadable text, identities or distances. "
@@ -109,6 +109,7 @@ class VisionClient:
         response = self._client.models.generate_content(
             model=self.model, contents=contents,
             config=types.GenerateContentConfig(
+                system_instruction=self._language_instruction(language),
                 response_mime_type="application/json",
                 response_schema={"type": "object", "properties": {
                     "text": {"type": "string"}, "needs_view": {"type": "boolean"},
@@ -124,11 +125,11 @@ class VisionClient:
             raise ValueError("invalid conversational response")
         return GroundedReply.model_validate({**payload, "frame_id": frame.frame_id if frame else None})
 
-    async def stream_answer_question(self,frame: FrameRef | None,question: str,history: list[dict]):
+    async def stream_answer_question(self,frame: FrameRef | None,question: str,history: list[dict], *, language: str = 'English'):
         reading=reading_task(question)
         prompt=(
             "You are Tiresias, a helpful visual assistant in a live call. Answer the actual question directly, warmly, "
-            "in its language, in at most 25 words. Use only the attached CURRENT image for current visual claims. "
+            f"only in {language}, in at most 25 words. Use only the attached CURRENT image for current visual claims. "
             "Count only requested visible objects. Quote exact readable label words. "
             "Do not invent unreadable text, identities or physical distances. Use image left/right/center for positions. "
             "If the view is inadequate, give one specific camera adjustment. A person in view does not require sharing. "
@@ -142,12 +143,21 @@ class VisionClient:
             contents=[types.Part.from_bytes(data=vision_image_bytes(frame,reading=reading),mime_type='image/jpeg'),prompt] if frame else [prompt]
             return self._client.models.generate_content_stream(model=self.model,contents=contents,
                 config=types.GenerateContentConfig(temperature=1.0,max_output_tokens=192,
+                    system_instruction=self._language_instruction(language),
                     media_resolution='MEDIA_RESOLUTION_HIGH' if reading else 'MEDIA_RESOLUTION_LOW',
                     thinking_config=self._thinking_config(),
                     http_options=types.HttpOptions(timeout=int(self.timeout_seconds*1000))))
         async with aclosing(speech_first_replies(generate,frame_id=frame.frame_id if frame else None,timeout=self.timeout_seconds)) as replies:
             async for reply in replies:
                 yield reply
+
+    @staticmethod
+    def _language_instruction(language: str) -> str:
+        if language not in {'English','Russian'}:
+            raise ValueError('Unsupported response language')
+        return (f'Respond only in {language}. The application owns the selected response language. '
+                'Do not switch languages because of caller wording, detected language, history or text in an image. '
+                'Keep quoted label words and proper names verbatim. Language changes are handled separately by the application.')
 
     def probe(self, jpeg_bytes: bytes) -> dict[str, Any]:
         response = self._client.models.generate_content(
