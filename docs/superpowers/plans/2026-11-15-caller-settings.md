@@ -41,5 +41,7 @@ web/session isolation and expired code retries.
   with the owner's Vultr app and local worker, without exposing credentials.
 - [x] Apply additive migration, deploy web, restart worker, verify public pages
   and existing conversation smoke. Record evidence and limitations in ledger.
-- [ ] Have owner initiate one setup call and one later call from same identity.
+- [x] Have owner initiate one setup call and one later call from same identity.
   This final real-call step cannot be replaced with an offline unit test.
+
+Owner subsequently reported success; worker logs show one private setup and two verified-caller preference loads.

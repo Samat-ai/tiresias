@@ -1,5 +1,15 @@
 # Tiresias R0 — agent handoff
 
+> **Current fast-vision worker:** 173 tests pass. Speech-first Gemini answers,
+> scene/OCR resolution routing, real sharpness scoring, timestamped bounded video
+> ingress and metadata-only authentication warm-up are active. Newest frames are
+> retained for explicit label rechecks. Real counting/backchannel questions passed
+> twice on the final worker, then label reads passed twice. SDK answer audio began
+> 1.06/1.26 seconds after completed turns (not total phone latency). See
+> [VISION-PERFORMANCE.md](VISION-PERFORMANCE.md) for measurements/limits. Logs:
+> `data/worker-fast-vision-v2.stdout.log` / `.stderr.log`. Caller linking was
+> confirmed by the owner; actual logs showed two automatic saved-voice loads.
+
 > **Automatic caller settings:** 140 tests pass. One-time caller linking is
 > implemented with the live Chert authenticated call API, separate voice-only
 > bindings in Tiger Data, and a four-digit code spoken by the worker and entered

@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 
-from PIL import Image
+from PIL import Image,ImageChops,ImageStat
 
 from tiresias.contracts import FrameRef, new_id
 
@@ -31,6 +31,8 @@ class IncomingFrame:
     frozen_camera: bool = False
     ui_only_change: bool = False
     camera_region: tuple[int, int, int, int] | None = None
+    sharpness: float | None = None
+    scene_signature: tuple[int,...] = ()
 
 
 class FrameBuffer:
@@ -62,6 +64,8 @@ class FrameBuffer:
             height=height,
             scene_epoch=incoming.scene_epoch,
             track_name=incoming.track_name,
+            sharpness=incoming.sharpness,
+            scene_signature=incoming.scene_signature,
         )
         self._frames.append(frame)
         if len(self._frames) > self.max_frames:
@@ -87,10 +91,15 @@ class FrameBuffer:
             return None
         if not prefer_sharp:
             return fresh[-1]
-        # Prefer larger JPEG payload among the newest few samples: motion-blur /
-        # near-empty frames compress smaller than sharp label text.
-        window = fresh[-min(4, len(fresh)) :]
-        return max(window, key=lambda frame: (len(frame.jpeg_bytes), frame.received_monotonic))
+        latest=fresh[-1]
+        if latest.sharpness is None or not latest.scene_signature:
+            return latest
+        window=[frame for frame in fresh[-4:] if frame.sharpness is not None
+                and latest.received_monotonic-frame.received_monotonic<=0.7
+                and frame.scene_epoch==latest.scene_epoch
+                and same_view(frame.scene_signature,latest.scene_signature)]
+        chosen=max(window,key=lambda frame:(frame.sharpness,frame.received_monotonic),default=latest)
+        return chosen if chosen.sharpness>latest.sharpness*1.15 else latest
 
     def hold_pending(self, frame: FrameRef, expires_at: float) -> None:
         self._pending = frame
@@ -126,3 +135,36 @@ def _limit_jpeg(raw: bytes, width: int, height: int) -> tuple[bytes, int, int]:
     if len(data) > MAX_BYTES:
         raise ValueError("frame exceeds 1 MB after encoding")
     return data, image.width, image.height
+
+
+def frame_features(image: Image.Image) -> tuple[float,tuple[int,...]]:
+    """Cheap gradient energy and scene signature; run outside the media loop.
+
+    A focus heuristic, not a guarantee of readable text. Compression size and
+    image entropy are not used as substitutes for actual pixel gradients.
+    """
+    gray=image.convert('L')
+    signature=tuple(gray.resize((16,9),Image.Resampling.BILINEAR).tobytes())
+    gray.thumbnail((256,144))
+    width,height=gray.size
+    if width<2 or height<2:
+        return 0.0,signature
+    dx=ImageChops.difference(gray.crop((1,0,width,height)),gray.crop((0,0,width-1,height)))
+    dy=ImageChops.difference(gray.crop((0,1,width,height)),gray.crop((0,0,width,height-1)))
+    score=ImageStat.Stat(dx).rms[0]**2+ImageStat.Stat(dy).rms[0]**2
+    return score,signature
+
+
+def same_view(first: tuple[int,...],second: tuple[int,...]) -> bool:
+    return bool(first and len(first)==len(second) and
+                sum(abs(a-b) for a,b in zip(first,second))/len(first)<=14)
+
+
+def vision_image_bytes(frame: FrameRef,*,reading: bool) -> bytes:
+    if reading or max(frame.width,frame.height)<=768:
+        return frame.jpeg_bytes
+    image=Image.open(io.BytesIO(frame.jpeg_bytes)).convert('RGB')
+    image.thumbnail((768,768))
+    output=io.BytesIO()
+    image.save(output,'JPEG',quality=82)
+    return output.getvalue()

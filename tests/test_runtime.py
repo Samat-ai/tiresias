@@ -325,3 +325,122 @@ async def test_inflight_refresh_cannot_restore_preferences_after_unlink(monkeypa
     finally:
         release.set()
         session.room.handlers['disconnected']()
+
+
+@pytest.mark.asyncio
+async def test_video_processing_does_not_block_loop_or_refresh_capture_timestamp(monkeypatch):
+    image=SimpleNamespace(width=64,height=64,data=bytes([120,120,120,255])*64*64)
+    times={}
+    class CameraFrame:
+        def convert(self,format):
+            time.sleep(0.05)
+            times['converted']=time.monotonic()
+            return image
+    class Stream:
+        def __init__(self,*args,**kw):
+            times['capacity']=kw.get('capacity')
+        async def __aiter__(self):
+            times['arrived']=time.monotonic()
+            yield SimpleNamespace(frame=CameraFrame())
+    monkeypatch.setattr(runtime.rtc,'VideoStream',Stream)
+    frames=FrameBuffer('test')
+    async def heartbeat():
+        await asyncio.sleep(0.01)
+        times['heartbeat']=time.monotonic()
+    await asyncio.gather(runtime._consume_video(object(),frames,'test',{'last':0}),heartbeat())
+    selected=frames.latest(2000,time.monotonic())
+    assert selected is not None
+    assert times['heartbeat']<times['converted']
+    assert selected.received_monotonic-times['arrived']<0.02
+    assert times['capacity']==1
+
+
+@pytest.mark.asyncio
+async def test_streamed_conversation_starts_before_trailing_metadata(monkeypatch):
+    from tiresias.contracts import GroundedReply
+    finish=asyncio.Event()
+    async def stream(frame,question,history):
+        yield GroundedReply(text='Two Pepsi cans.',frame_id=frame.frame_id)
+        await finish.wait()
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(stream_answer_question=stream))
+    push(frames)
+    await session.transcript('How many Pepsi cans can you see?')
+    try:
+        assert await asyncio.wait_for(session.messages.get(),1)=='Two Pepsi cans.'
+    finally:
+        finish.set()
+
+
+@pytest.mark.asyncio
+async def test_turn_to_audio_metric_waits_for_actual_speaking_state(monkeypatch):
+    from tiresias.contracts import GroundedReply
+    metrics=[]
+    async def nothing(): pass
+    monkeypatch.setattr(runtime,'TelemetrySink',lambda url:SimpleNamespace(start=lambda:None,emit=lambda **event:metrics.append(event),close=nothing))
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=lambda *args:GroundedReply(text='Two cans.')))
+    push(frames)
+    await session.transcript('How many Pepsi cans can you see?')
+    await asyncio.wait_for(session.messages.get(),1)
+    assert not any(row['stage']=='turn_to_first_audio' for row in metrics)
+    session.handlers['agent_state_changed'](SimpleNamespace(new_state='speaking'))
+    session.handlers['agent_state_changed'](SimpleNamespace(new_state='speaking'))
+    assert len([row for row in metrics if row['stage']=='turn_to_first_audio'])==1
+
+
+@pytest.mark.asyncio
+async def test_recheck_uses_new_item_even_when_old_label_is_sharper(monkeypatch):
+    def analyze(frame,target):
+        return Observation(frame_id=frame.frame_id,visible_text=['OLD' if frame.jpeg_bytes==b'old' else 'NEW'],quality=Quality.READABLE)
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(analyze_frame=analyze))
+    now=time.monotonic()
+    frames.push(incoming(frames,received_monotonic=now-0.3,jpeg_bytes=b'old',sharpness=100,scene_signature=(100,)*144))
+    frames.push(incoming(frames,received_monotonic=now,jpeg_bytes=b'new',sharpness=1,scene_signature=(100,)*144))
+    await session.transcript('Check this.')
+    await asyncio.wait_for(session.messages.get(),1)
+    assert 'NEW' in await asyncio.wait_for(session.messages.get(),1)
+
+
+@pytest.mark.asyncio
+async def test_video_queue_wait_does_not_make_an_old_frame_fresh(monkeypatch):
+    image=SimpleNamespace(width=64,height=64,data=bytes([120,120,120,255])*64*64)
+    events=asyncio.Queue()
+    times={}
+    class CameraFrame:
+        def __init__(self,slow): self.slow=slow
+        def convert(self,format):
+            if self.slow: time.sleep(0.45)
+            return image
+    class Stream:
+        def __init__(self,*args,**kw):
+            async def publish():
+                await events.put(SimpleNamespace(frame=CameraFrame(True)))
+                await asyncio.sleep(0.02)
+                times['second_arrival']=time.monotonic()
+                await events.put(SimpleNamespace(frame=CameraFrame(False)))
+                await events.put(None)
+            self.publisher=asyncio.create_task(publish())
+        async def __aiter__(self):
+            while (event:=await events.get()) is not None:
+                yield event
+        async def aclose(self):
+            times['closed']=True
+            await self.publisher
+    monkeypatch.setattr(runtime.rtc,'VideoStream',Stream)
+    frames=FrameBuffer('test')
+    await runtime._consume_video(object(),frames,'test',{'last':0})
+    assert time.monotonic()-times['second_arrival']>0.1
+    assert frames.latest(100,time.monotonic()) is None
+    assert times['closed']
+
+
+@pytest.mark.asyncio
+async def test_backchannel_finalized_just_after_fast_answer_does_not_prompt_again(monkeypatch):
+    from tiresias.contracts import GroundedReply
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=lambda *args:GroundedReply(text='Two Pepsi cans.')))
+    push(frames)
+    await session.transcript('How many Pepsi cans can you see?')
+    assert await asyncio.wait_for(session.messages.get(),1)=='Two Pepsi cans.'
+    await asyncio.sleep(0)
+    await session.transcript('Yes.')
+    await asyncio.sleep(0.25)
+    assert session.messages.empty()

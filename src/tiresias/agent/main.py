@@ -20,7 +20,7 @@ from tiresias.agent.intent import IntentClassifier
 from tiresias.agent.media import CALLER_AUDIO_TRACK, CALLER_VIDEO_TRACK, FrameBuffer, IncomingFrame
 from tiresias.agent.speech import CallLifecycle, SpeechScheduler
 from tiresias.agent.turns import LatestTurn, QuietGate, acknowledge_and_analyze
-from tiresias.agent.vision import VisionClient
+from tiresias.agent.vision import VisionClient,reading_task
 from tiresias.config import Settings
 from tiresias.contracts import IntentKind
 from tiresias.db import connect
@@ -173,7 +173,10 @@ async def entrypoint(ctx: JobContext) -> None:
     turns = LatestTurn()
     quiet = QuietGate()
     conversation_history: list[dict] = []
+    response_audio_clock={'started':None,'ready':False}
+    recent_speech={'finished_at':0.0}
     subscribed_video: set[str] = set()
+    video_tasks: set[asyncio.Task] = set()
     voice_state={'preferences':VoicePreferences(), 'user_id':None, 'attempts':0, 'closed':False}
     voice_state.update(manual_profile=False,auto_user_id=None,setup_code=None,selection_revision=0)
     profile_entry=ProfileCodeEntry()
@@ -231,6 +234,7 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.exception("speak failed: %s", '[private setup instructions]' if private else text[:80])
         finally:
             if started is not None:
+                recent_speech['finished_at']=time.monotonic()
                 measure('speech_playout',started)
 
     def apply_voice(preferences):
@@ -356,40 +360,54 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_user_state(ev) -> None:
         quiet.set_speaking(ev.new_state == "speaking")
 
+    @session.on('agent_state_changed')
+    def _on_agent_state(ev):
+        if ev.new_state=='speaking' and response_audio_clock['ready'] and response_audio_clock['started'] is not None:
+            measure('turn_to_first_audio',response_audio_clock['started'])
+            response_audio_clock['started']=None
+
     async def run_conversation(question: str) -> None:
         if vision_budget["left"] <= 0:
             await speak("I've reached the image limit for this call. Call again to keep going.")
             return
-        frame = buffer.latest(settings.frame_max_local_age_ms, time.monotonic())
+        frame = (buffer.latest if reading_task(question) else buffer.best)(settings.frame_max_local_age_ms, time.monotonic())
         history = list(conversation_history[-6:])
         vision_budget["left"] -= 1
         started = time.monotonic()
+        stream=None
+        delivered=False
         try:
-            def answer():
-                vision = _get_vision()
-                if vision is None:
-                    raise RuntimeError("vision is not configured")
-                return vision.answer_question(frame, question, history)
-
-            reply = await asyncio.wait_for(asyncio.to_thread(answer), settings.vision_timeout_seconds)
+            vision=await asyncio.to_thread(_get_vision)
+            if vision is None:
+                raise RuntimeError('vision is not configured')
+            if hasattr(vision,'stream_answer_question'):
+                stream=vision.stream_answer_question(frame,question,history)
+                reply=await asyncio.wait_for(anext(stream),settings.vision_timeout_seconds)
+            else:
+                reply=await asyncio.wait_for(asyncio.to_thread(vision.answer_question,frame,question,history),settings.vision_timeout_seconds)
+            logger.info('conversational speech ready elapsed_ms=%d frame=%s',(time.monotonic()-started)*1000,
+                        f'{frame.width}x{frame.height}' if frame else 'none')
+            measure('conversation',started)
+            controller.set_time(time.monotonic())
+            for event in controller.conversational_reply(reply,frame):
+                response_audio_clock['ready']=True
+                delivered=True
+                await speak(event.text)
         except Exception:
             logger.exception("conversational vision failed")
-            measure('conversation',started,'error')
-            await speak("I couldn't finish that look. Could you try again?")
-            return
-        logger.info("conversational result elapsed_ms=%d frame=%s", (time.monotonic()-started)*1000,
-                    f"{frame.width}x{frame.height}" if frame else "none")
-        measure('conversation',started)
-        controller.set_time(time.monotonic())
-        for event in controller.conversational_reply(reply, frame):
-            await speak(event.text)
+            if not delivered:
+                measure('conversation',started,'error')
+                await speak("I couldn't finish that look. Could you try again?")
+        finally:
+            if stream is not None:
+                await stream.aclose()
 
     async def run_vision(stage: str, revision: int) -> list[str]:
         loop = asyncio.get_running_loop()
         if vision_budget["left"] <= 0:
             return ["I've reached the image limit for this call. Call again to keep going."]
         # A recheck must see the current selection, not the largest old JPEG.
-        frame = buffer.latest(settings.frame_max_local_age_ms, time.monotonic())
+        frame = (buffer.latest if stage=='recheck' else buffer.best)(settings.frame_max_local_age_ms, time.monotonic())
         if frame is None:
             return ["I'm not getting a current camera view. Check that your video is on."]
         target = controller.task.target
@@ -444,6 +462,7 @@ async def entrypoint(ctx: JobContext) -> None:
         classifier = _get_intent_classifier()
         command=profile_entry.consume(cleaned)
         if command is not None:
+            response_audio_clock['started']=None
             async def change_voice():
                 await session.interrupt(force=True)
                 await voice_command(command)
@@ -452,8 +471,18 @@ async def entrypoint(ctx: JobContext) -> None:
 
         # Backchannels must not replace an answer already being generated/spoken.
         immediate = classifier.route(cleaned, controller.task, pending_prompt_id)
-        if immediate.kind == IntentKind.SOCIAL and turns.task is not None and not turns.task.done():
-            return
+        if immediate.kind == IntentKind.SOCIAL:
+            if turns.task is not None and not turns.task.done():
+                return
+            if cleaned.lower().strip(' .!?') in {
+                'yes','yeah','yep','okay','ok','sure','thanks','thank you','да','спасибо','хорошо',
+            } and time.monotonic()-recent_speech['finished_at']<2:
+                # Faster answers can finish before STT finalizes a backchannel
+                # spoken during playback. Do not add a second prompt afterward.
+                return
+        response_audio_clock['started']=time.monotonic() if immediate.kind in {
+            IntentKind.CONVERSATION,IntentKind.CHECK,IntentKind.FIND_TARGET,IntentKind.CHANGE_TARGET} else None
+        response_audio_clock['ready']=False
         conversation_history.append({"role": "user", "text": cleaned})
         del conversation_history[:-6]
 
@@ -487,6 +516,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     stage = "recheck" if intent.kind == IntentKind.CHECK else "candidate"
                     results = await acknowledge_and_analyze(acknowledge(), run_vision(stage, revision))
                     for result in results:
+                        response_audio_clock['ready']=True
                         await speak(result)
                     return
             await acknowledge()
@@ -540,7 +570,9 @@ async def entrypoint(ctx: JobContext) -> None:
                     publication.set_video_quality(rtc.VideoQuality.VIDEO_QUALITY_HIGH)
                     logger.info("requested highest caller video quality for label reading")
                 subscribed_video.add(publication.sid)
-                asyncio.create_task(_consume_video(track, buffer, epoch, sample_state))
+                video_task=asyncio.create_task(_consume_video(track, buffer, epoch, sample_state))
+                video_tasks.add(video_task)
+                video_task.add_done_callback(video_tasks.discard)
         if name == CALLER_AUDIO_TRACK or track.kind == rtc.TrackKind.KIND_AUDIO:
             lifecycle.on_caller_audio(epoch)
             logger.info("caller audio track ready")
@@ -552,6 +584,8 @@ async def entrypoint(ctx: JobContext) -> None:
         if voice_state['closed']:
             return
         turns.cancel()
+        for video_task in tuple(video_tasks):
+            video_task.cancel()
         buffer.clear()
         lifecycle.disconnect()
         voice_state['closed']=True
@@ -567,11 +601,15 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_session_close(ev):
         _on_disconnect()
 
-    # Construct the provider client while the bridge is warming rather than on
-    # the first caller question. No extra inference/API request is made.
+    # Prime OAuth/HTTPS while the bridge is warming. This metadata GET does
+    # not run inference or send a caller image.
     async def warm_vision():
         try:
-            await asyncio.to_thread(_get_vision)
+            def warm():
+                vision=_get_vision()
+                if vision is not None and hasattr(vision,'prewarm'):
+                    vision.prewarm()
+            await asyncio.to_thread(warm)
         except Exception as error:
             logger.warning('Vision client warmup failed: %s',type(error).__name__)
     asyncio.create_task(warm_vision())
@@ -630,45 +668,60 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 async def _consume_video(track: rtc.RemoteVideoTrack, buffer: FrameBuffer, session_id: str, sample_state: dict) -> None:
-    stream = rtc.VideoStream(track)
+    stream = rtc.VideoStream(track,capacity=1)
     loop = asyncio.get_running_loop()
-    async for event in stream:
-        now = time.monotonic()
-        if now - sample_state["last"] < 0.5:
-            continue
-        sample_state["last"] = now
-        frame = event.frame
+    ingress=asyncio.Queue(maxsize=1)
+
+    async def receive():
         try:
-            argb = frame.convert(rtc.VideoBufferType.RGBA)
-
-            def encode() -> tuple[bytes, int, int]:
-                from tiresias.agent.media import JPEG_QUALITY, MAX_EDGE
-
-                image = Image.frombytes("RGBA", (argb.width, argb.height), bytes(argb.data)).convert("RGB")
-                image.thumbnail((MAX_EDGE, MAX_EDGE))
-                import io
-
-                out = io.BytesIO()
-                image.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-                return out.getvalue(), image.width, image.height
-
-            jpeg, width, height = await loop.run_in_executor(None, encode)
-            buffer.push(
-                IncomingFrame(
-                    session_id=session_id,
-                    track_name=CALLER_VIDEO_TRACK,
-                    participant_kind="caller",
-                    jpeg_bytes=jpeg,
-                    width=width,
-                    height=height,
-                    received_monotonic=time.monotonic(),
-                    received_at=time.time(),
-                    camera_region=(0, 0, width, height),
-                    scene_epoch=int(time.time()) // 30,
-                )
-            )
+            async for event in stream:
+                arrived=(event.frame,time.monotonic(),time.time())
+                if ingress.full():
+                    ingress.get_nowait()
+                ingress.put_nowait(arrived)
+            await ingress.put(None)
         except Exception:
-            logger.exception("failed to ingest caller frame")
+            logger.exception('camera ingress failed')
+            if ingress.full():
+                ingress.get_nowait()
+            ingress.put_nowait(None)
+
+    receiver=asyncio.create_task(receive())
+    try:
+        while (arrived:=await ingress.get()) is not None:
+            frame,now,captured_at=arrived
+            if now-sample_state['last']<0.35:
+                continue
+            sample_state['last']=now
+            try:
+                def encode():
+                    from tiresias.agent.media import JPEG_QUALITY,MAX_EDGE,frame_features
+                    import io
+                    argb=frame.convert(rtc.VideoBufferType.RGBA)
+                    image=Image.frombytes('RGBA',(argb.width,argb.height),bytes(argb.data)).convert('RGB')
+                    image.thumbnail((MAX_EDGE,MAX_EDGE))
+                    sharpness,signature=frame_features(image)
+                    out=io.BytesIO()
+                    image.save(out,format='JPEG',quality=JPEG_QUALITY,optimize=True)
+                    return out.getvalue(),image.width,image.height,sharpness,signature
+
+                jpeg,width,height,sharpness,signature=await loop.run_in_executor(None,encode)
+                from tiresias.agent.media import same_view
+                previous=sample_state.get('signature')
+                if previous and not same_view(previous,signature):
+                    sample_state['scene_epoch']=sample_state.get('scene_epoch',0)+1
+                sample_state['signature']=signature
+                buffer.push(IncomingFrame(session_id=session_id,track_name=CALLER_VIDEO_TRACK,
+                    participant_kind='caller',jpeg_bytes=jpeg,width=width,height=height,
+                    received_monotonic=now,received_at=captured_at,camera_region=(0,0,width,height),
+                    scene_epoch=sample_state.get('scene_epoch',0),sharpness=sharpness,scene_signature=signature))
+            except Exception:
+                logger.exception('failed to ingest caller frame')
+    finally:
+        receiver.cancel()
+        await asyncio.gather(receiver,return_exceptions=True)
+        if close:=getattr(stream,'aclose',None):
+            await close()
 
 
 async def _publish_status_video(ctx: JobContext) -> None:

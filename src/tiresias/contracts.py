@@ -163,6 +163,8 @@ class FrameRef(StrictModel):
     height: int
     scene_epoch: int
     track_name: str
+    sharpness: Optional[float] = Field(default=None,ge=0)
+    scene_signature: tuple[int,...] = Field(default=(),exclude=True,repr=False)
 
     model_config = ConfigDict(extra="forbid")
 

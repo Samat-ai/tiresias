@@ -153,3 +153,62 @@
   actual public app. QA used a fictional 555 number; no phone call/SMS was sent.
   Normal HTTPS health returns 200. Owner was given the one-time setup steps;
   real setup and second-call auto-loading remain the explicit final handset gate.
+
+## Fast vision work — November 15
+
+- Owner subsequently reported caller linking works. Local worker logs contain
+  one private setup-code announcement and **two verified-caller automatic voice
+  loads**, supporting the reported setup/repeat-call success.
+- Read the entire Downloads fast-vision Gemini 3 guide. Existing continuous JPEG
+  capture, minimal thinking and Flash TTS were already present. Guide claims of
+  fixed 650 ms end-to-end audio, guaranteed sharpness from entropy, arbitrary
+  distance estimates and an unscoped memory SQL query were not adopted.
+- Ruling: implement measured stream-first speech, low-detail scene/high-detail
+  OCR routing, gradient scoring and bounded fresh frames in existing Python,
+  with no raw image persistence, new background speech or database lookup on
+  the visual answer path. Keep strict JSON/policy validation for label matches.
+  Cost: no new persistent spatial memory or automatic hazard warnings in this
+  change; explicit rechecks favor newest evidence over an old sharper label.
+- Consulted current Google primary docs for media resolution, thinking levels
+  and Gemini 3.8. Actual Vertex requests verified LOW/HIGH resolution and 3.8 LOW
+  thinking. 3.8 was slower on the tested cases, so Flash-Lite remains default.
+- Initial synthetic 2x2 benchmark: existing JSON median speech-ready 1272 ms,
+  candidate speech-first 674 ms, both 4/4 correct. Implemented pipeline with
+  warm-up: six conversation samples median **729 ms**, 6/6 correct; three compact
+  label samples median **962 ms**, 3/3 exact code/date checks. These are model text
+  readiness, not total FaceTime audio latency; sample size is small. Artifacts
+  `data/vision-benchmark-before.json` / `vision-benchmark-after.json` stay local.
+- A free model metadata GET primes OAuth/connection in the waiting room without
+  inference or camera data; real cold warm-up took 1197–1680 ms.
+- Fresh review found three Important issues, reproduced RED: malformed stream
+  delimiters could speak metadata, ambiguous OCR wording lost detail, processing
+  queue waits could make old frames appear fresh. Fixes reject metadata/fragments
+  and truncated output, default ambiguous questions to high detail, and stamp
+  frames in a continuously draining ingress task before a one-frame processing
+  queue. Video conversion/scoring is off-loop; streams/tasks close on disconnect.
+- Full suite before final truncated-output check: **171 passed**. Final run and
+  new real-provider smoke are pending. Existing worker has not been restarted
+  with the new vision code yet, preserving working calls during implementation.
+- Minor deferred benchmark limitations: original before data was captured before
+  code edits and is preserved separately; later `current_json` runs call the now
+  tuned JSON method. `image_bytes` in production benchmark rows is the source
+  frame size, not necessarily the submitted resized scene payload. Neither field
+  is used to claim unchanged-baseline reproduction or payload savings.
+- Final code suite: **173 passed**, 29.40 seconds. New review regressions and
+  delayed acknowledgment test all pass. One early overlap run returned a correct
+  first answer but timed out before a second transcript; cause not established.
+  Independent label checks passed. Faster speech exposed a separate late-final
+  “yes” producing an unnecessary prompt; added a two-second positive backchannel
+  grace period, with a regression watched RED->GREEN.
+- Restarted final worker (`data/worker-fast-vision-v2.*.log`). Final real-provider
+  overlap/repeat run passed both counted answers without extra social speech;
+  subsequent label run passed both reads. Tiger Data for that final conversation:
+  model speech readiness **683/886 ms**, SDK answer audio **1059/1263 ms** after
+  completed turn, TTS first audio **170/172 ms**. These omit STT/phone transport.
+- Measured scene submission separately: **46959 -> 18947 bytes**, while detailed
+  label input stays **50112 bytes**; pixel features cost approximately **4.2 ms**
+  off-loop on this computer. Public performance template now defines timings.
+- Web release `20261115t115130z`, source archive SHA256
+  `739e17a5cdb86044f47279ef8fae18b6ab0f4981577ecbff4d2e61d0929d4302`.
+  Public health passed after deployment; caller-link secret preserved. An expired
+  QA browser session correctly received 401 on the performance page.
