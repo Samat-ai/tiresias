@@ -60,8 +60,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     app = FastAPI(title='Tiresias', docs_url=None, redoc_url=None)
     templates = Jinja2Templates(directory=str(ROOT/'templates'))
+    static_assets=sorted(path for path in (ROOT/'static').rglob('*')
+                         if path.is_file() and path.suffix in {'.css','.js','.png','.gif','.webp'})
     templates.env.globals['asset_version']=hashlib.sha256(
-        (ROOT/'static/app.js').read_bytes()+(ROOT/'static/app.css').read_bytes()).hexdigest()[:12]
+        b''.join(path.read_bytes() for path in static_assets)).hexdigest()[:12]
     app.mount('/static', StaticFiles(directory=str(ROOT/'static')), name='static')
     hasher = password_hasher(memory_kib=settings.argon2_memory_kib, time_cost=settings.argon2_time_cost,
                              parallelism=settings.argon2_parallelism)

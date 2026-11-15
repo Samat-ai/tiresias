@@ -2,6 +2,11 @@ const form=document.querySelector('#voice-form');
 if(form){
  const status=document.querySelector('#status'),speed=document.querySelector('#speed'),output=document.querySelector('#speed-value'),audio=document.querySelector('#audio-preview');
  let audioURL;
+ const companion=document.querySelector('#companion-avatar'),reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+ if(companion)companion.addEventListener('error',()=>{if(companion.getAttribute('src')!==companion.dataset.still)companion.src=companion.dataset.still});
+ const showCompanion=()=>{if(companion)companion.src=(!audio.paused&&!audio.ended&&!reducedMotion.matches)?companion.dataset.speaking:companion.dataset.still};
+ ['play','pause','ended','error'].forEach(event=>audio.addEventListener(event,showCompanion));
+ reducedMotion.addEventListener('change',showCompanion);
  const preferences=()=>({voice_id:form.querySelector('[name=voice_id]:checked').value,tone:form.tone.value,speed:Number(speed.value)});
  const message=(text,error=false)=>{status.textContent=text;status.classList.toggle('error',error)};
  const send=async(url)=>{const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('#csrf').value},body:JSON.stringify(preferences())});if(!response.ok){let text='Something went wrong. Please try again.';try{const data=await response.json();if(typeof data.detail==='string')text=data.detail}catch{}throw new Error(text)}return response};

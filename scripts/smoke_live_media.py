@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 import io
+import hashlib
 import json
 import time
 import wave
@@ -22,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 from tiresias.config import Settings
 
 
-async def main(*, conversation: bool = False, backchannel: bool = False, profile_code: str = '', profile_paused: bool = False) -> None:
+async def main(*, conversation: bool = False, backchannel: bool = False, profile_code: str = '', profile_paused: bool = False, states: bool = False) -> None:
     settings = Settings()
     room_name = f"tiresias-smoke-{uuid4().hex[:10]}"
     service = api.LiveKitAPI(settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret)
@@ -31,6 +32,28 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
     received = bytearray()
     audio_ready = asyncio.Event()
     result = {"room": room_name, "scope": "LiveKit + ElevenLabs STT/TTS + Vertex vision; excludes FaceTime"}
+    video_state={'frames':0,'digests':set(),'image':None,'last_sample':0}
+
+    async def consume_video(track):
+        stream=rtc.VideoStream(track,format=rtc.VideoBufferType.RGB24,capacity=1)
+        try:
+            async for event in stream:
+                video_state['frames']+=1
+                now=time.monotonic()
+                if now-video_state['last_sample']<0.4:
+                    continue
+                video_state['last_sample']=now
+                frame=event.frame
+                image=Image.frombytes('RGB',(frame.width,frame.height),bytes(frame.data))
+                video_state['image']=image
+                video_state['dimensions']=[frame.width,frame.height]
+                video_state['digests'].add(hashlib.sha256(image.tobytes()).hexdigest())
+        finally:
+            await stream.aclose()
+
+    def save_video_sample(name):
+        if video_state['image'] is not None:
+            video_state['image'].save(Path('data')/f'call-state-{name}.png')
 
     async def consume(track):
         stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
@@ -49,6 +72,8 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
     def subscribed(track, publication, participant):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             tasks.append(asyncio.create_task(consume(track)))
+        if track.kind == rtc.TrackKind.KIND_VIDEO and publication.name=='tiresias-status':
+            tasks.append(asyncio.create_task(consume_video(track)))
 
     async def transcribe(client, raw):
         output = io.BytesIO()
@@ -77,6 +102,17 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
             )
             response.raise_for_status()
             command_audio = response.content
+            pause_audio=b''
+            if states:
+                pause=await client.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{settings.elevenlabs_voice_id}",
+                    params={'output_format':'pcm_16000'},headers={'xi-api-key':settings.elevenlabs_key()},
+                    json={'text':'Stop talking.','model_id':settings.elevenlabs_tts_model})
+                pause.raise_for_status()
+                pause_audio=pause.content
+                result['pause_input_transcript']=await transcribe(client,pause_audio)
+                if 'stop' not in result['pause_input_transcript'].lower():
+                    raise RuntimeError('Synthetic pause command was not intelligible in offline STT')
             profile_audio = b''
             profile_parts = []
             if profile_code:
@@ -171,7 +207,17 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
             ))
             print("isolated room dispatched:", room_name, flush=True)
             await asyncio.wait_for(audio_ready.wait(), 30)
-            await asyncio.sleep(8)  # Let the greeting finish before the command.
+            if states:
+                await asyncio.sleep(2)
+                save_video_sample('greeting')
+                await play_input(pause_audio+bytes(32000))
+                await asyncio.sleep(5)
+                pause_transcript=await transcribe(client,bytes(received))
+                result['pause']={'command':'Stop talking.','transcript':pause_transcript,'passed':"listening" in pause_transcript.lower()}
+                save_video_sample('listening')
+                print(json.dumps({'pause':result['pause']}),flush=True)
+            else:
+                await asyncio.sleep(8)  # Let the greeting finish before the command.
             result["greeting_audio_bytes"] = len(received)
             received.clear()
             if profile_code:
@@ -201,6 +247,8 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
                 started = time.monotonic()
                 pcm = bytes(16000 * 2) + command_audio + bytes(16000 * 2 * (1 if backchannel else 3))
                 await play_input(pcm)
+                if states:
+                    save_video_sample(f'answer-{number+1}')
                 if backchannel:
                     # Say a one-word acknowledgement during returned speech.
                     await asyncio.wait_for(audio_ready.wait(), 10)
@@ -221,7 +269,11 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
                          "test_window_seconds": round(time.monotonic() - started, 2)}
                 result["checks"].append(check)
                 print(json.dumps(check), flush=True)
+            result['video']={'frames':video_state['frames'],'different_samples':len(video_state['digests']),
+                             'dimensions':video_state.get('dimensions')}
             result["passed"] = all(check["passed"] for check in result["checks"])
+            if states:
+                result['passed']=result['passed'] and result['pause']['passed'] and video_state['frames']>=10 and len(video_state['digests'])>=3
     finally:
         for task in tasks:
             task.cancel()
@@ -231,11 +283,11 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
             await service.room.delete_room(api.DeleteRoomRequest(room=room_name))
         finally:
             await service.aclose()
-            name = 'profile-paused-smoke-results.json' if profile_paused else ('backchannel-smoke-results.json' if backchannel else ('conversation-smoke-results.json' if conversation else 'live-smoke-results.json'))
+            name = 'call-states-smoke-results.json' if states else ('profile-paused-smoke-results.json' if profile_paused else ('backchannel-smoke-results.json' if backchannel else ('conversation-smoke-results.json' if conversation else 'live-smoke-results.json')))
             path = Path('data') / name
             path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     if not result.get("passed"):
-        raise SystemExit("FAIL: main live media path did not return the expected label twice")
+        raise SystemExit("FAIL: one or more live media checks failed; inspect the saved result.")
 
 
 if __name__ == "__main__":
@@ -244,9 +296,10 @@ if __name__ == "__main__":
     parser.add_argument('--backchannel', action='store_true', help='Say yes during the returned answer')
     parser.add_argument('--profile-code',default='',help='Load an existing saved voice profile before checking the image')
     parser.add_argument('--profile-paused',action='store_true',help='Enter the profile code across pauses and during spoken instructions')
+    parser.add_argument('--states',action='store_true',help='Interrupt the greeting with Stop talking and verify audible feedback and animated video')
     args = parser.parse_args()
     if args.profile_code and (not args.profile_code.isdigit() or len(args.profile_code)!=8):
         parser.error('profile code must contain eight digits')
     if args.profile_paused and not args.profile_code:
         parser.error('--profile-paused requires --profile-code')
-    asyncio.run(main(conversation=args.conversation, backchannel=args.backchannel,profile_code=args.profile_code,profile_paused=args.profile_paused))
+    asyncio.run(main(conversation=args.conversation, backchannel=args.backchannel,profile_code=args.profile_code,profile_paused=args.profile_paused,states=args.states))

@@ -153,7 +153,7 @@ def intent_from_payload(payload: object, transcript: str, task: TaskContext | No
 
 
 def _fast_controls(norm: str, raw: str, pending_prompt_id: str | None) -> UserIntent | None:
-    if norm in {"stop", "stop talking", "quiet", "cancel"} or norm.startswith("stop "):
+    if norm in {"stop", "stop talking", "quiet", "cancel", "wait", "hold on", "pause", "listen"} or norm.startswith("stop "):
         return UserIntent(kind=IntentKind.STOP, transcript=raw)
     if norm in {"repeat", "say that again", "what did you say"}:
         return UserIntent(kind=IntentKind.REPEAT, transcript=raw)

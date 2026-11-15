@@ -53,10 +53,13 @@ class FakeSession:
             await self.agent.on_user_turn_completed(None, SimpleNamespace(text_content=text))
 
 
-async def setup_call(monkeypatch, vision, *, caller_links=False):
+async def setup_call(monkeypatch, vision, *, caller_links=False, bridge_ready=True):
     session = FakeSession(tts=SimpleNamespace(update_options=lambda **kwargs: None))
     frames = FrameBuffer('test')
-    monkeypatch.setattr(runtime, 'AgentSession', lambda **kwargs: session)
+    def make_session(**kwargs):
+        session.runtime_options=kwargs
+        return session
+    monkeypatch.setattr(runtime, 'AgentSession', make_session)
     monkeypatch.setattr(runtime, 'FrameBuffer', lambda **kwargs: frames)
     monkeypatch.setattr(runtime, '_get_intent_classifier', lambda: IntentClassifier(api_key=''))
     monkeypatch.setattr(runtime, '_get_vision', lambda: vision)
@@ -72,9 +75,13 @@ async def setup_call(monkeypatch, vision, *, caller_links=False):
         monkeypatch.setattr(runtime,'_read_voice_profile',lambda uid: runtime.VoicePreferences())
 
     monkeypatch.setattr(runtime, '_publish_status_video', nothing)
-    await runtime.entrypoint(SimpleNamespace(room=FakeRoom(), connect=nothing))
+    room=FakeRoom()
+    if not bridge_ready:
+        room.metadata=''
+    await runtime.entrypoint(SimpleNamespace(room=room, connect=nothing))
     # Allow the bridge-ready greeting task to finish.
-    assert 'Tiresias' in await asyncio.wait_for(session.messages.get(), 1)
+    if bridge_ready:
+        assert 'Tiresias' in await asyncio.wait_for(session.messages.get(), 1)
     return session, frames
 
 
@@ -444,3 +451,93 @@ async def test_backchannel_finalized_just_after_fast_answer_does_not_prompt_agai
     await session.transcript('Yes.')
     await asyncio.sleep(0.25)
     assert session.messages.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('text',['Stop.','Wait.','Hold on.'])
+async def test_pause_controls_confirm_listening_without_a_vision_request(monkeypatch,text):
+    session,frames=await setup_call(monkeypatch,None)
+    await session.transcript(text)
+    assert await asyncio.wait_for(session.messages.get(),1)=="I'm listening."
+
+
+@pytest.mark.asyncio
+async def test_interrupting_a_pending_visual_question_gets_one_brief_ack(monkeypatch):
+    from tiresias.contracts import GroundedReply
+    started,release=threading.Event(),threading.Event()
+    def answer(frame,question,history):
+        if 'Pepsi' in question:
+            started.set()
+            assert release.wait(3)
+            return GroundedReply(text='Old answer.')
+        return GroundedReply(text='The can is on the left.')
+    session,frames=await setup_call(monkeypatch,SimpleNamespace(answer_question=answer))
+    push(frames)
+    await session.transcript('How many Pepsi cans can you see?')
+    assert await asyncio.to_thread(started.wait,1)
+    await session.transcript('Where are they?')
+    try:
+        messages=[await asyncio.wait_for(session.messages.get(),1.5)]
+        if messages[0]=='Got it.':
+            messages.append(await asyncio.wait_for(session.messages.get(),1.5))
+        assert messages[-1]=='The can is on the left.'
+        assert 'Old answer.' not in messages
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_pause_is_acknowledged_even_just_after_another_status_cue(monkeypatch):
+    session,frames=await setup_call(monkeypatch,None)
+    for text in ('Wait.','Hold on.'):
+        await session.transcript(text)
+        assert await asyncio.wait_for(session.messages.get(),1)=="I'm listening."
+
+
+@pytest.mark.asyncio
+async def test_failed_status_video_publish_releases_source(monkeypatch):
+    from tiresias.agent.feedback import CallFeedback
+    from tiresias.agent.turns import QuietGate
+    closed=[]
+    class Source:
+        def __init__(self,*args): pass
+        async def aclose(self): closed.append(True)
+    async def fail(*args): raise RuntimeError('publish failed')
+    async def say(text): pass
+    monkeypatch.setattr(runtime.rtc,'VideoSource',Source)
+    monkeypatch.setattr(runtime.rtc.LocalVideoTrack,'create_video_track',lambda *args:object())
+    ctx=SimpleNamespace(room=SimpleNamespace(local_participant=SimpleNamespace(publish_track=fail)))
+    with pytest.raises(RuntimeError,match='publish failed'):
+        await runtime._publish_status_video(ctx,CallFeedback(QuietGate(0),say))
+    assert closed==[True]
+
+
+@pytest.mark.asyncio
+async def test_pause_is_acknowledged_before_bridge_ready_metadata(monkeypatch):
+    session,frames=await setup_call(monkeypatch,None,bridge_ready=False)
+    await session.transcript('Wait.')
+    assert await asyncio.wait_for(session.messages.get(),1)=="I'm listening."
+    session.room.handlers['disconnected']()
+
+
+@pytest.mark.asyncio
+async def test_caller_audio_reaches_stt_during_the_first_seconds_of_greeting(monkeypatch):
+    import struct
+    from livekit.agents.voice import AgentSession as SDKSession
+    from livekit.agents.voice.agent_activity import AgentActivity
+    session,_=await setup_call(monkeypatch,None)
+    sdk=SDKSession(**session.runtime_options)
+    sdk._agent_state='speaking'
+    # Emulate the SDK's initial AEC timer, using the real session configuration
+    # and push_audio implementation, rather than a fake transcript handler.
+    sdk._aec_warmup_timer=asyncio.get_running_loop().call_later(10,lambda:None)
+    pushed=[]
+    recognition=SimpleNamespace(_push_audio=lambda frame,stt_frame=None:pushed.append(stt_frame or frame))
+    activity=SimpleNamespace(_started=True,_session=sdk,_current_speech=None,
+                             _rt_session=None,_audio_recognition=recognition)
+    frame=runtime.rtc.AudioFrame(struct.pack('<320h',*([1000]*320)),16000,1,320)
+    try:
+        AgentActivity.push_audio(activity,frame)
+        assert bytes(pushed[0].data)==bytes(frame.data)
+    finally:
+        sdk._aec_warmup_timer.cancel()

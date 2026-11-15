@@ -92,7 +92,7 @@ def route_utterance(text: str, task: TaskContext | None, pending_prompt_id: str 
     norm = re.sub(r"\s+", " ", raw.lower()).strip(' .!?')
     if _excluded(norm):
         return UserIntent(kind=IntentKind.UNSUPPORTED, transcript=raw)
-    if norm in {"stop", "stop talking", "quiet", "cancel"} or norm.startswith("stop "):
+    if norm in {"stop", "stop talking", "quiet", "cancel", "wait", "hold on", "pause", "listen"} or norm.startswith("stop "):
         return UserIntent(kind=IntentKind.STOP, transcript=raw)
     if norm in {"repeat", "say that again", "what did you say"}:
         return UserIntent(kind=IntentKind.REPEAT, transcript=raw)

@@ -212,3 +212,51 @@
   `739e17a5cdb86044f47279ef8fae18b6ab0f4981577ecbff4d2e61d0929d4302`.
   Public health passed after deployment; caller-link secret preserved. An expired
   QA browser session correctly received 401 on the performance page.
+
+## Accessible call states and character — November 15
+
+- Requested: spoken feedback after interruption, animated FaceTime character,
+  then Higgsfield-generated art shared with the website.
+- Implemented per-call generation-owned feedback, SDK speech-driven states,
+  quiet-gated/cancellable status cues and stop/wait/hold-on acknowledgments.
+  Cues stay out of conversation history; cue audio does not satisfy answer
+  latency metrics. Explicit pause acknowledgments bypass reminder cooldown.
+- Tests watched RED for silent/misrouted pause controls, cooldown suppressing
+  a second explicit pause and failed video publication source cleanup. Fixed
+  controls/cooldown and SDK protobuf CopyFrom for video encoding. Full suite
+  at this point: **183 passed**, 32.99 seconds. Final feature review pending.
+- Procedural fallback preview visually inspected; 480x640 at 10fps, approximately
+  1 ms render time. Preview GIF/contact sheet in ignored data directory.
+- Ruling: owner specifically requested Higgsfield, replacing the procedural art
+  as the main asset. Preserve local rendering/state control, add offline playback
+  of generated loops, and share master still with the existing website. This
+  adds bundled public artwork, but no model/API calls on the call path.
+- Higgsfield plugin initially installed but tools absent from the running task;
+  an unauthenticated endpoint probe returned 401, which did not establish a
+  failure of the owner's sign-in. Tools later appeared and authenticated balance
+  succeeded. Account has 10 credits and an available unlimited allowance through
+  November 18. All character generations explicitly use_unlim=true; never charge
+  credits on failure. Master pending: 13a6a539-3a81-4242-bfed-da668865db50.
+- Existing fast-vision worker remains active; these changes are not activated yet.
+- Final review found/fixed feedback being disconnected before bridge metadata;
+  regression watched RED->GREEN. Website missing GIF restores the still.
+- Real early controls were clipped or absent: actual SDK default AEC warmup
+  zeroes caller PCM for three seconds of initial agent output. Added a test using
+  real SDK push_audio and runtime configuration, watched silence fail, then set
+  public aec_warmup_duration=0. Follow-up review accepted fix and flagged handset
+  echo as a remaining verification gate. No noise/barge-in policy expansion.
+- The free Higgsfield job stayed queued. Owner approved up to **2 existing
+  credits**; each master/GIF quote was 0.5. Four assets completed, balance **8**.
+  Native outputs: 16-frame, 512px GIFs; optimized web still: **22,976 bytes**.
+- Final full suite **187 passed**, 33.61 seconds. Preview call passed early-stop
+  acknowledgment and two counted answers; independent overlap/backchannel test
+  passed both answers. Normal worker then passed early stop + two label reads,
+  with 449 video frames / 111 distinct samples at 480x640. Earlier transient
+  timeouts remain recorded; their cause was not conclusively established.
+- Website deployed release **20261115t130709z**, source archive SHA256
+  **c6f4d42fd28adc7a376392f1e43cfbc889e88530ded7b63687d3ba63d214abac**.
+  Desktop/mobile artwork inspected; actual preview switched to speaking GIF
+  and restored still. Reduced motion kept still through audio playback.
+- Activated normal worker, logs `data/worker-accessible-states.*.log`. Full
+  behavior/provenance/evidence in docs/CALL-STATES.md. Owner handset echo/animation
+  check remains pending; no new Chert settings are needed.

@@ -1,5 +1,16 @@
 # Tiresias R0 — agent handoff
 
+> **Current accessible states/avatar:** 187 tests pass. Sparse spoken cues,
+> acknowledged Stop/Wait/Hold on, generation-owned listening/thinking/speaking
+> states, and a Higgsfield-generated character are active on the normal worker.
+> The SDK's initial three-second STT mute was disabled after reproducing clipped
+> early controls. Actual normal-worker stop cue, two label reads and changing
+> 480×640 video passed; final preview counting/backchannel checks passed twice.
+> Website artwork is live at https://tiresias.ink. Four generated assets used
+> exactly 2 approved existing credits. See [CALL-STATES.md](CALL-STATES.md) for
+> evidence and remaining handset/echo check. Active logs:
+> `data/worker-accessible-states.stdout.log` / `.stderr.log`.
+
 > **Current fast-vision worker:** 173 tests pass. Speech-first Gemini answers,
 > scene/OCR resolution routing, real sharpness scoring, timestamped bounded video
 > ingress and metadata-only authentication warm-up are active. Newest frames are

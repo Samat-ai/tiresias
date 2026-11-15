@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def source_paths():
     for folder, suffixes in [('src/tiresias', {'.py', '.html', '.css', '.js'}),
+                             ('src/tiresias/static/avatar', {'.png', '.gif', '.webp'}),
                              ('migrations', {'.sql'}), ('deploy', {'.sh', '.service', '.md', ''})]:
         for path in sorted((ROOT/folder).rglob('*')):
             if path.is_file() and path.suffix in suffixes and '__pycache__' not in path.parts:

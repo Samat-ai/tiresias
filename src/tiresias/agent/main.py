@@ -13,9 +13,10 @@ from livekit.agents import AgentServer, AutoSubscribe, JobContext, StopResponse,
 from livekit.agents.voice import Agent, AgentSession, room_io
 from livekit.plugins import elevenlabs, silero
 from livekit.plugins.elevenlabs import VoiceSettings
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from tiresias.agent.controller import TaskController
+from tiresias.agent.feedback import CallFeedback
 from tiresias.agent.intent import IntentClassifier
 from tiresias.agent.media import CALLER_AUDIO_TRACK, CALLER_VIDEO_TRACK, FrameBuffer, IncomingFrame
 from tiresias.agent.speech import CallLifecycle, SpeechScheduler
@@ -37,11 +38,6 @@ settings = Settings()
 AGENT_NAME = os.environ.get("AGENT_NAME", settings.agent_name)
 server = AgentServer()
 _VAD = silero.VAD.load()
-_STATUS_IMAGE = Image.new("RGB", (320, 240), color=(16, 24, 40))
-_draw = ImageDraw.Draw(_STATUS_IMAGE)
-_draw.rectangle((20, 20, 300, 220), outline=(120, 180, 255), width=3)
-_draw.text((70, 110), "Tiresias", fill=(220, 230, 255))
-_STATUS_FRAME = rtc.VideoFrame(320, 240, rtc.VideoBufferType.RGB24, _STATUS_IMAGE.tobytes())
 
 
 class TiresiasAgent(Agent):
@@ -181,6 +177,7 @@ async def entrypoint(ctx: JobContext) -> None:
     voice_state.update(manual_profile=False,auto_user_id=None,setup_code=None,selection_revision=0)
     profile_entry=ProfileCodeEntry()
     caller_task=None
+    avatar_task=None
     caller_resolved=asyncio.Event()
     controller.speed=voice_state['preferences'].speed
     call_id=str(uuid4())
@@ -193,6 +190,10 @@ async def entrypoint(ctx: JobContext) -> None:
                        outcome=outcome,session_id=call_id,source=source,model_id=settings.gemini_model or 'gemini-3.5-flash-lite')
 
     session = AgentSession(
+        # Preserve early controls on the Chert caller track. SDK default AEC
+        # warmup replaces its first 3s of speech with silence during greeting.
+        # Echo suppression remains a FaceTime/bridge handset verification gate.
+        aec_warmup_duration=0,
         stt=elevenlabs.STT(
             model=settings.elevenlabs_stt_model,
             api_key=key,
@@ -220,14 +221,19 @@ async def entrypoint(ctx: JobContext) -> None:
         },
     )
 
-    async def speak(text: str, *, interruptible: bool = False, private: bool = False) -> None:
+    async def speak(text: str, *, interruptible: bool = False, private: bool = False,
+                    status_cue: bool = False, answer: bool = False) -> None:
         started=None
         try:
-            await quiet.wait()
+            if not status_cue:
+                await feedback.before_answer()
+                await quiet.wait()
             started=time.monotonic()
+            if answer:
+                response_audio_clock['ready']=True
             logger.info("speaking response: %s", '[private setup instructions]' if private else text[:160])
-            await session.say(text, allow_interruptions=interruptible,add_to_chat_ctx=not private)
-            if not private:
+            await session.say(text, allow_interruptions=interruptible,add_to_chat_ctx=not (private or status_cue))
+            if not (private or status_cue):
                 conversation_history.append({"role": "assistant", "text": text})
                 del conversation_history[:-6]
         except Exception:
@@ -236,6 +242,24 @@ async def entrypoint(ctx: JobContext) -> None:
             if started is not None:
                 recent_speech['finished_at']=time.monotonic()
                 measure('speech_playout',started)
+
+    async def say_status(text):
+        await speak(text,status_cue=True)
+
+    feedback=CallFeedback(quiet,say_status)
+
+    def submit_turn(work, *, cue=None, delay=1.5):
+        token=feedback.begin_work()
+        if cue:
+            feedback.queue_cue(cue,token=token,delay=delay)
+
+        async def run():
+            try:
+                await work
+            finally:
+                feedback.finish_work(token)
+        turns.submit(run())
+        return token
 
     def apply_voice(preferences):
         voice_state['selection_revision']+=1
@@ -342,7 +366,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     caller_resolved.set()
                     if result['challenge']:
                         voice_state['setup_code']=result['challenge']['code']
-                        turns.submit(announce_setup_code(voice_state['setup_code']))
+                        submit_turn(announce_setup_code(voice_state['setup_code']))
                 except Exception as error:
                     logger.warning('Caller settings sync unavailable: %s',type(error).__name__)
                     caller_resolved.set()
@@ -359,9 +383,11 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("user_state_changed")
     def _on_user_state(ev) -> None:
         quiet.set_speaking(ev.new_state == "speaking")
+        feedback.user_speaking=ev.new_state == 'speaking'
 
     @session.on('agent_state_changed')
     def _on_agent_state(ev):
+        feedback.agent_speaking=ev.new_state == 'speaking'
         if ev.new_state=='speaking' and response_audio_clock['ready'] and response_audio_clock['started'] is not None:
             measure('turn_to_first_audio',response_audio_clock['started'])
             response_audio_clock['started']=None
@@ -390,9 +416,8 @@ async def entrypoint(ctx: JobContext) -> None:
             measure('conversation',started)
             controller.set_time(time.monotonic())
             for event in controller.conversational_reply(reply,frame):
-                response_audio_clock['ready']=True
                 delivered=True
-                await speak(event.text)
+                await speak(event.text,answer=True)
         except Exception:
             logger.exception("conversational vision failed")
             if not delivered:
@@ -455,9 +480,10 @@ async def entrypoint(ctx: JobContext) -> None:
         lifecycle.on_caller_audio(epoch)
         if lifecycle.accept_audio("caller", cleaned) is None:
             return
+        feedback.connect()
         logger.info("user transcript: %s", cleaned[:120])
         if cleaned.lower().strip(' .!?') in {'repeat setup code','repeat the setup code'} and voice_state['setup_code']:
-            turns.submit(announce_setup_code(voice_state['setup_code']))
+            submit_turn(announce_setup_code(voice_state['setup_code']))
             return
         classifier = _get_intent_classifier()
         command=profile_entry.consume(cleaned)
@@ -466,7 +492,7 @@ async def entrypoint(ctx: JobContext) -> None:
             async def change_voice():
                 await session.interrupt(force=True)
                 await voice_command(command)
-            turns.submit(change_voice())
+            submit_turn(change_voice())
             return
 
         # Backchannels must not replace an answer already being generated/spoken.
@@ -485,12 +511,16 @@ async def entrypoint(ctx: JobContext) -> None:
         response_audio_clock['ready']=False
         conversation_history.append({"role": "user", "text": cleaned})
         del conversation_history[:-6]
+        was_active=feedback.busy or feedback.agent_speaking
 
         async def route_and_act() -> None:
             intent = immediate
             logger.info("routed intent: %s", intent.kind.value)
             if intent.kind != IntentKind.SOCIAL:
                 await session.interrupt(force=True)
+            if intent.kind == IntentKind.CONVERSATION:
+                feedback.queue_cue('Got it.' if was_active else 'Taking a look.',
+                                   token=work_token,delay=0 if was_active else 1.5)
             if intent.kind == IntentKind.SOCIAL:
                 greeting = cleaned.lower().strip(' .!?') in {"hello", "hi", "hey", "привет"}
                 await speak("I'm here. What would you like me to look at?" if greeting else "Okay. What would you like to know?")
@@ -502,6 +532,10 @@ async def entrypoint(ctx: JobContext) -> None:
                 return
             controller.set_time(time.monotonic())
             events = controller.handle(intent)
+            if intent.kind == IntentKind.STOP:
+                feedback.busy=False
+                await feedback.queue_cue("I'm listening.",token=work_token,delay=0,force=True)
+                return
             if intent.kind in {IntentKind.SLOWER, IntentKind.FASTER}:
                 apply_voice(voice_state['preferences'].model_copy(update={'speed':controller.speed}))
                 await save_voice()
@@ -509,6 +543,7 @@ async def entrypoint(ctx: JobContext) -> None:
             async def acknowledge():
                 for event in events:
                     await speak(event.text)
+                feedback.queue_cue('Still checking.',token=work_token,delay=3.5)
 
             if intent.kind in {IntentKind.FIND_TARGET, IntentKind.CHANGE_TARGET, IntentKind.CHECK}:
                 revision = controller.inflight_revision
@@ -516,12 +551,11 @@ async def entrypoint(ctx: JobContext) -> None:
                     stage = "recheck" if intent.kind == IntentKind.CHECK else "candidate"
                     results = await acknowledge_and_analyze(acknowledge(), run_vision(stage, revision))
                     for result in results:
-                        response_audio_clock['ready']=True
-                        await speak(result)
+                        await speak(result,answer=True)
                     return
             await acknowledge()
 
-        turns.submit(route_and_act())
+        work_token=submit_turn(route_and_act())
 
     @session.on("user_input_transcribed")
     def _on_transcript(ev) -> None:
@@ -575,6 +609,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 video_task.add_done_callback(video_tasks.discard)
         if name == CALLER_AUDIO_TRACK or track.kind == rtc.TrackKind.KIND_AUDIO:
             lifecycle.on_caller_audio(epoch)
+            feedback.connect()
             logger.info("caller audio track ready")
 
     ctx.room.on("track_subscribed", _on_track)
@@ -584,6 +619,9 @@ async def entrypoint(ctx: JobContext) -> None:
         if voice_state['closed']:
             return
         turns.cancel()
+        feedback.close()
+        if avatar_task:
+            avatar_task.cancel()
         for video_task in tuple(video_tasks):
             video_task.cancel()
         buffer.clear()
@@ -619,6 +657,9 @@ async def entrypoint(ctx: JobContext) -> None:
         while time.monotonic() < deadline:
             meta = ctx.room.metadata or ""
             if "chert_bridge_ready" in meta:
+                if voice_state['closed']:
+                    return
+                feedback.connect()
                 if caller_task is not None and not caller_resolved.is_set():
                     try:
                         await asyncio.wait_for(caller_resolved.wait(),1.5)
@@ -630,6 +671,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 return
             await asyncio.sleep(0.1)
         greeting = lifecycle.on_bridge_ready(epoch)
+        if voice_state['closed']:
+            return
+        feedback.connect()
         if greeting and not lifecycle.transcripts:
             await speak(greeting, interruptible=False)
 
@@ -643,6 +687,7 @@ async def entrypoint(ctx: JobContext) -> None:
         if not voice_state['closed']:
             agent.accept_user_message(ev.item)
 
+    logger.info('Starting call audio session')
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -657,6 +702,7 @@ async def entrypoint(ctx: JobContext) -> None:
             ],
         ),
     )
+    logger.info('Call audio session ready')
     for participant in ctx.room.remote_participants.values():
         _link_bridge(participant)
         # connect() may subscribe before the event handlers were installed.
@@ -664,7 +710,12 @@ async def entrypoint(ctx: JobContext) -> None:
             if publication.track is not None:
                 _on_track(publication.track, publication, participant)
     asyncio.create_task(wait_bridge_ready())
-    await _publish_status_video(ctx)
+    try:
+        avatar_task=await _publish_status_video(ctx,feedback)
+        if voice_state['closed'] and avatar_task:
+            avatar_task.cancel()
+    except Exception:
+        logger.exception('Status video unavailable; voice remains active')
 
 
 async def _consume_video(track: rtc.RemoteVideoTrack, buffer: FrameBuffer, session_id: str, sample_state: dict) -> None:
@@ -724,19 +775,38 @@ async def _consume_video(track: rtc.RemoteVideoTrack, buffer: FrameBuffer, sessi
             await close()
 
 
-async def _publish_status_video(ctx: JobContext) -> None:
-    source = rtc.VideoSource(320, 240)
+async def _publish_status_video(ctx: JobContext, feedback: CallFeedback) -> asyncio.Task:
+    from tiresias.agent.avatar import AvatarRenderer
+    renderer=await asyncio.to_thread(AvatarRenderer)
+    source = rtc.VideoSource(renderer.width, renderer.height)
     track = rtc.LocalVideoTrack.create_video_track("tiresias-status", source)
     options = rtc.TrackPublishOptions()
     options.source = rtc.TrackSource.SOURCE_CAMERA
-    await ctx.room.local_participant.publish_track(track, options)
+    options.video_encoding.CopyFrom(rtc.VideoEncoding(max_framerate=10,max_bitrate=450_000))
+    try:
+        await ctx.room.local_participant.publish_track(track, options)
+    except BaseException:
+        await source.aclose()
+        raise
 
     async def pump() -> None:
-        while True:
-            source.capture_frame(_STATUS_FRAME)
-            await asyncio.sleep(1.0)
+        try:
+            while not feedback.closed:
+                started=time.monotonic()
+                pixels=await asyncio.to_thread(renderer.render_bytes,feedback.state,started)
+                if feedback.closed:
+                    break
+                source.capture_frame(rtc.VideoFrame(renderer.width,renderer.height,rtc.VideoBufferType.RGB24,pixels))
+                await asyncio.sleep(max(0.01,0.1-(time.monotonic()-started)))
+        except Exception:
+            logger.exception('Status animation stopped; voice remains active')
+        finally:
+            await source.aclose()
 
-    asyncio.create_task(pump())
+    task=asyncio.create_task(pump())
+    # Enter the task's try/finally before exposing it to disconnect cancellation.
+    await asyncio.sleep(0)
+    return task
 
 
 def main() -> None:
