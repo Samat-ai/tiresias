@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 
 
 class Settings(BaseSettings):
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
     app_base_url: str = "http://localhost:8000"
     service_consent_version: str = "2026-11-14.v1"
     database_url: str = ""
+    timescale_service_url: str = ""
     test_database_url: str = ""
     mongodb_uri: str = ""
     mongodb_database: str = "tiresias"
@@ -24,6 +26,22 @@ class Settings(BaseSettings):
     agent_name: str = "tiresias-agent"
     gemini_api_key: str = ""
     gemini_model: str = ""
+    google_genai_use_vertexai: bool = False
+    google_cloud_project: str = ""
+    google_cloud_location: str = "global"
+    google_application_credentials: str = ""
+
+    def gemini_backend_options(self) -> dict:
+        # ADC discovers this variable itself; Settings also supports .env files.
+        if self.google_genai_use_vertexai and self.google_application_credentials:
+            import os
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = self.google_application_credentials
+        return {
+            "vertexai": self.google_genai_use_vertexai,
+            "project": self.google_cloud_project,
+            "location": self.google_cloud_location,
+        }
+
     elevenlabs_api_key: str = ""
     eleven_api_key: str = ""
     elevenlabs_stt_model: str = "scribe_v2_realtime"
@@ -35,6 +53,8 @@ class Settings(BaseSettings):
     chert_integration_mode: str = "cli"
     private_snapshot_dir: str = "./data/snapshots"
     phone_data_encryption_key: str = ""
+    caller_link_secret: str = ""
+    chert_credentials_file: str = ""
     solana_rpc_url: str = "https://api.devnet.solana.com"
     solana_treasury_key_file: str = ""
     solana_reward_lamports: int = 50_000_000
@@ -58,6 +78,12 @@ class Settings(BaseSettings):
     argon2_parallelism: int = 1
     max_vision_requests_per_call: int = 30
     reward_cap_per_call: int = 3
+
+    @model_validator(mode='after')
+    def database_alias(self):
+        if not self.database_url and self.timescale_service_url:
+            self.database_url=self.timescale_service_url
+        return self
 
     def elevenlabs_key(self) -> str:
         return self.elevenlabs_api_key or self.eleven_api_key

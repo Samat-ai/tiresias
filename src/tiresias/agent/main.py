@@ -4,7 +4,8 @@ import asyncio
 import logging
 import os
 import time
-from uuid import uuid4
+from collections import deque
+from uuid import uuid4, UUID
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -18,9 +19,15 @@ from tiresias.agent.controller import TaskController
 from tiresias.agent.intent import IntentClassifier
 from tiresias.agent.media import CALLER_AUDIO_TRACK, CALLER_VIDEO_TRACK, FrameBuffer, IncomingFrame
 from tiresias.agent.speech import CallLifecycle, SpeechScheduler
+from tiresias.agent.turns import LatestTurn, QuietGate, acknowledge_and_analyze
 from tiresias.agent.vision import VisionClient
 from tiresias.config import Settings
 from tiresias.contracts import IntentKind
+from tiresias.db import connect
+from tiresias.preferences import VoicePreferences, VOICE_BY_ID, ProfileCodeEntry, resolve_profile_code, save_preferences, get_preferences
+from tiresias.telemetry import TelemetrySink
+from tiresias.chert_identity import ChertCallerResolver
+from tiresias.caller_links import linked_preferences, issue_challenge
 
 load_dotenv(".env.local")
 load_dotenv(".env")
@@ -46,19 +53,26 @@ class TiresiasAgent(Agent):
             )
         )
         self._on_user_text = on_user_text
-        self._last_handled = ""
+        self._completed_messages = deque(maxlen=128)
+
+    def accept_user_message(self,new_message) -> None:
+        if getattr(new_message,'role','user')!='user':
+            return
+        message_id=getattr(new_message,'id',None)
+        if message_id and message_id in self._completed_messages:
+            return
+        text = getattr(new_message, "text_content", "") or ""
+        if not text:
+            content = getattr(new_message, "content", [])
+            text = content if isinstance(content, str) else " ".join(p for p in content if isinstance(p, str))
+        if text.strip():
+            if message_id:
+                self._completed_messages.append(message_id)
+            self._on_user_text(text.strip())
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        text = ""
-        content = getattr(new_message, "content", None)
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = " ".join(str(part) for part in content if part)
-        text = (text or getattr(new_message, "text_content", "") or "").strip()
-        if text and text != self._last_handled:
-            self._last_handled = text
-            self._on_user_text(text)
+        self.accept_user_message(new_message)
+        # Turn detection owns dispatch; raw STT segments are only diagnostics.
         raise StopResponse()
 
 
@@ -78,12 +92,13 @@ def _get_vision() -> VisionClient | None:
     global _VISION
     if _VISION is not None:
         return _VISION
-    if not settings.gemini_api_key:
+    if not settings.gemini_api_key and not settings.google_genai_use_vertexai:
         return None
     _VISION = VisionClient(
         settings.gemini_api_key,
         model=settings.gemini_model,
         timeout_seconds=settings.vision_timeout_seconds,
+        **settings.gemini_backend_options(),
     )
     return _VISION
 
@@ -96,8 +111,40 @@ def _get_intent_classifier() -> IntentClassifier:
         api_key=settings.gemini_api_key,
         model=settings.gemini_model,
         timeout_seconds=min(8.0, float(settings.vision_timeout_seconds)),
+        **settings.gemini_backend_options(),
     )
     return _INTENT
+
+
+def _load_voice_profile(code):
+    if not settings.database_url:
+        return None
+    with connect(settings.database_url,connect_timeout=2) as conn:
+        return resolve_profile_code(conn,code)
+
+
+def _save_voice_profile(user_id, preferences):
+    with connect(settings.database_url,connect_timeout=2) as conn:
+        save_preferences(conn,user_id,preferences)
+
+
+def _read_voice_profile(user_id):
+    with connect(settings.database_url,connect_timeout=2) as conn:
+        return get_preferences(conn,user_id)['preferences']
+
+
+def _resolve_chert_caller(call_id):
+    return ChertCallerResolver(settings.chert_project_id,
+        credentials_file=settings.chert_credentials_file or None).resolve(call_id)
+
+
+def _sync_caller_voice(caller,*,allow_challenge=True):
+    with connect(settings.database_url,connect_timeout=2) as conn:
+        conn.execute("SET LOCAL statement_timeout='2000ms'")
+        linked=linked_preferences(conn,handle=caller.handle,key=settings.caller_link_secret)
+        challenge=issue_challenge(conn,handle=caller.handle,key=settings.caller_link_secret,
+                                  call_id=caller.call_id) if allow_challenge else None
+        return {'linked':linked,'challenge':challenge}
 
 
 @server.rtc_session(agent_name=AGENT_NAME)
@@ -118,58 +165,260 @@ async def entrypoint(ctx: JobContext) -> None:
         buffer,
         scheduler,
         evidence_max_age_ms=settings.visual_evidence_max_age_ms,
-        frame_max_age_ms=max(settings.frame_max_local_age_ms, settings.visual_evidence_max_age_ms),
+        frame_max_age_ms=settings.frame_max_local_age_ms,
     )
     pending_prompt_id: str | None = None
     sample_state = {"last": 0.0}
     vision_budget = {"left": settings.max_vision_requests_per_call}
-    handled_texts: set[str] = set()
+    turns = LatestTurn()
+    quiet = QuietGate()
+    conversation_history: list[dict] = []
+    subscribed_video: set[str] = set()
+    voice_state={'preferences':VoicePreferences(), 'user_id':None, 'attempts':0, 'closed':False}
+    voice_state.update(manual_profile=False,auto_user_id=None,setup_code=None,selection_revision=0)
+    profile_entry=ProfileCodeEntry()
+    caller_task=None
+    caller_resolved=asyncio.Event()
+    controller.speed=voice_state['preferences'].speed
+    call_id=str(uuid4())
+    source='REPLAY' if ctx.room.name.startswith('tiresias-smoke-') else 'FACETIME'
+    telemetry=TelemetrySink(settings.database_url)
+    telemetry.start()
+
+    def measure(stage, started, outcome='ok'):
+        telemetry.emit(stage=stage,duration_ms=max(0,int((time.monotonic()-started)*1000)),
+                       outcome=outcome,session_id=call_id,source=source,model_id=settings.gemini_model or 'gemini-3.5-flash-lite')
 
     session = AgentSession(
         stt=elevenlabs.STT(
             model=settings.elevenlabs_stt_model,
             api_key=key,
             language_code="en",
+            secondary_languages=["ru"],
+            include_language_detection=True,
+            server_vad={"vad_silence_threshold_secs": 0.6, "vad_threshold": 0.5},
         ),
         tts=elevenlabs.TTS(
             model=settings.elevenlabs_tts_model,
-            voice_id=settings.elevenlabs_voice_id,
+            voice_id=voice_state['preferences'].voice_id,
             api_key=key,
-            voice_settings=_TTS_VOICE_SETTINGS,
+            voice_settings=VoiceSettings(**voice_state['preferences'].tts_options()),
             apply_text_normalization="on",
         ),
         vad=_VAD,
+        turn_handling={
+            "turn_detection": "stt",
+            "endpointing": {"min_delay": 0.2, "max_delay": 2.0},
+            "interruption": {
+                # Final meaningful utterances interrupt explicitly below. Keep
+                # listening during playback without noise/backchannel VAD cuts.
+                "enabled": False, "discard_audio_if_uninterruptible": False,
+            },
+        },
     )
 
-    async def speak(text: str, *, interruptible: bool = True) -> None:
+    async def speak(text: str, *, interruptible: bool = False, private: bool = False) -> None:
+        started=None
         try:
-            await session.say(text, allow_interruptions=interruptible)
+            await quiet.wait()
+            started=time.monotonic()
+            logger.info("speaking response: %s", '[private setup instructions]' if private else text[:160])
+            await session.say(text, allow_interruptions=interruptible,add_to_chat_ctx=not private)
+            if not private:
+                conversation_history.append({"role": "assistant", "text": text})
+                del conversation_history[:-6]
         except Exception:
-            logger.exception("speak failed: %s", text[:80])
+            logger.exception("speak failed: %s", '[private setup instructions]' if private else text[:80])
+        finally:
+            if started is not None:
+                measure('speech_playout',started)
 
-    async def run_vision(stage: str, revision: int) -> None:
-        loop = asyncio.get_running_loop()
-        vision = await loop.run_in_executor(None, _get_vision)
-        if vision is None:
-            await speak("Vision isn't set up yet.")
+    def apply_voice(preferences):
+        voice_state['selection_revision']+=1
+        voice_state['preferences']=preferences
+        controller.speed=preferences.speed
+        session.tts.update_options(voice_id=preferences.voice_id,voice_settings=VoiceSettings(**preferences.tts_options()))
+        logger.info('voice preferences applied voice=%s tone=%s speed=%s',preferences.voice_id,preferences.tone,preferences.speed)
+
+    async def save_voice():
+        if voice_state['user_id'] and settings.database_url:
+            try:
+                await asyncio.to_thread(_save_voice_profile,voice_state['user_id'],voice_state['preferences'])
+            except Exception as error:
+                logger.warning('Could not save voice preferences: %s',type(error).__name__)
+                return False
+        return True
+
+    async def voice_command(command):
+        if command.cancel_profile:
+            await speak('Profile entry cancelled.')
             return
+        if command.profile_code is not None:
+            if len(command.profile_code)!=8:
+                remaining=8-len(command.profile_code)
+                await speak('Say the eight digits of your profile code, one at a time.' if remaining==8
+                            else f'I have {len(command.profile_code)} digits. Say the remaining {remaining}.')
+                return
+            voice_state['attempts']+=1
+            if voice_state['attempts']>5:
+                await speak('Please call again to try another profile code.')
+                return
+            try:
+                linked=await asyncio.to_thread(_load_voice_profile,command.profile_code)
+            except Exception as error:
+                logger.warning('Profile lookup failed: %s',type(error).__name__)
+                await speak('I could not load that profile just now. Your current voice still works.')
+                return
+            if not linked:
+                await speak('That profile code was not recognized. Say the eight digits one at a time.')
+                return
+            voice_state['user_id']=linked['user_id']
+            voice_state['manual_profile']=True
+            apply_voice(linked['preferences'])
+            await speak('Your saved voice preferences are loaded.')
+            return
+        preferences=VoicePreferences.model_validate({**voice_state['preferences'].model_dump(),**command.updates})
+        apply_voice(preferences)
+        saved=await save_voice()
+        description=VOICE_BY_ID[preferences.voice_id]['name'] if 'voice_id' in command.updates else preferences.tone+' tone'
+        await speak(f'Using {description}.' if saved else f'Using {description} for this call. I could not save the change just now.')
+
+    async def refresh_voice():
+        while not voice_state['closed']:
+            await asyncio.sleep(3)
+            if voice_state['user_id'] and settings.database_url:
+                try:
+                    user_id=voice_state['user_id']
+                    revision=voice_state['selection_revision']
+                    preferences=await asyncio.to_thread(_read_voice_profile,user_id)
+                    if (voice_state['closed'] or voice_state['user_id']!=user_id
+                            or voice_state['selection_revision']!=revision):
+                        continue
+                    if preferences!=voice_state['preferences']:
+                        apply_voice(preferences)
+                except Exception as error:
+                    logger.warning('Profile refresh unavailable: %s',type(error).__name__)
+
+    refresh_task=asyncio.create_task(refresh_voice()) if settings.database_url else None
+
+    async def announce_setup_code(code):
+        await session.interrupt(force=True)
+        await speak('To remember your voice settings, enter these four digits on the website: '
+                    +', '.join(code)+'. You only need to do this once.',private=True)
+
+    async def follow_caller(call_id):
+        try:
+            caller=None
+            for _ in range(3):
+                caller=await asyncio.to_thread(_resolve_chert_caller,call_id)
+                if voice_state['closed']:
+                    return
+                if caller:
+                    break
+                await asyncio.sleep(1)
+            if not caller:
+                logger.info('Caller auto-selection unavailable; keeping normal call controls.')
+                return
+            while not voice_state['closed']:
+                try:
+                    result=await asyncio.to_thread(_sync_caller_voice,caller,allow_challenge=lifecycle.bridge_ready)
+                    if voice_state['closed']:
+                        return
+                    linked=result['linked']
+                    if not voice_state['manual_profile']:
+                        if linked and voice_state['auto_user_id']!=linked['user_id']:
+                            voice_state['user_id']=linked['user_id']
+                            voice_state['auto_user_id']=linked['user_id']
+                            apply_voice(linked['preferences'])
+                            logger.info('Saved voice preferences loaded for verified caller.')
+                        elif not linked and voice_state['auto_user_id']:
+                            voice_state['user_id']=None
+                            voice_state['auto_user_id']=None
+                            apply_voice(VoicePreferences())
+                    caller_resolved.set()
+                    if result['challenge']:
+                        voice_state['setup_code']=result['challenge']['code']
+                        turns.submit(announce_setup_code(voice_state['setup_code']))
+                except Exception as error:
+                    logger.warning('Caller settings sync unavailable: %s',type(error).__name__)
+                    caller_resolved.set()
+                await asyncio.sleep(2.5)
+        finally:
+            caller_resolved.set()
+
+    @session.on('metrics_collected')
+    def _on_metrics(ev):
+        ttfb=getattr(getattr(ev,'metrics',None),'ttfb',None)
+        if ttfb is not None:
+            telemetry.emit(stage='tts_first_audio',duration_ms=max(0,int(ttfb*1000)),outcome='ok',session_id=call_id,source=source)
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev) -> None:
+        quiet.set_speaking(ev.new_state == "speaking")
+
+    async def run_conversation(question: str) -> None:
         if vision_budget["left"] <= 0:
-            await speak("I've used my vision budget for this call. Ask a person to look.")
+            await speak("I've reached the image limit for this call. Call again to keep going.")
             return
-        frame = buffer.best(settings.visual_evidence_max_age_ms, time.monotonic())
+        frame = buffer.latest(settings.frame_max_local_age_ms, time.monotonic())
+        history = list(conversation_history[-6:])
+        vision_budget["left"] -= 1
+        started = time.monotonic()
+        try:
+            def answer():
+                vision = _get_vision()
+                if vision is None:
+                    raise RuntimeError("vision is not configured")
+                return vision.answer_question(frame, question, history)
+
+            reply = await asyncio.wait_for(asyncio.to_thread(answer), settings.vision_timeout_seconds)
+        except Exception:
+            logger.exception("conversational vision failed")
+            measure('conversation',started,'error')
+            await speak("I couldn't finish that look. Could you try again?")
+            return
+        logger.info("conversational result elapsed_ms=%d frame=%s", (time.monotonic()-started)*1000,
+                    f"{frame.width}x{frame.height}" if frame else "none")
+        measure('conversation',started)
+        controller.set_time(time.monotonic())
+        for event in controller.conversational_reply(reply, frame):
+            await speak(event.text)
+
+    async def run_vision(stage: str, revision: int) -> list[str]:
+        loop = asyncio.get_running_loop()
+        if vision_budget["left"] <= 0:
+            return ["I've reached the image limit for this call. Call again to keep going."]
+        # A recheck must see the current selection, not the largest old JPEG.
+        frame = buffer.latest(settings.frame_max_local_age_ms, time.monotonic())
         if frame is None:
-            await speak("That view's gone. Hold it still and try again.")
-            return
+            return ["I'm not getting a current camera view. Check that your video is on."]
+        target = controller.task.target
+        started = time.monotonic()
         vision_budget["left"] -= 1
         try:
-            observation = await loop.run_in_executor(
-                None,
-                lambda: vision.analyze_frame(frame, controller.task.target),
+            async def analyze():
+                vision = await loop.run_in_executor(None, _get_vision)
+                if vision is None:
+                    raise RuntimeError("GEMINI_API_KEY is not configured")
+                return await loop.run_in_executor(None, lambda: vision.analyze_frame(frame, target))
+
+            observation = await asyncio.wait_for(
+                analyze(), timeout=settings.vision_timeout_seconds,
             )
         except Exception:
             logger.exception("vision analysis failed")
-            await speak("Not sure on this one. Hold it steady, or ask a person.")
-            return
+            measure('vision',started,'error')
+            if controller.inflight_revision == revision:
+                controller.inflight_revision = None
+            return ["The image service didn't respond. Say try again and I'll take another look."]
+        logger.info(
+            "vision result elapsed_ms=%d frame_age_ms=%d dimensions=%sx%s bytes=%d quality=%s text_spans=%d",
+            (time.monotonic() - started) * 1000,
+            (started - frame.received_monotonic) * 1000,
+            frame.width, frame.height, len(frame.jpeg_bytes), observation.quality.value,
+            len(observation.visible_text),
+        )
+        measure('vision',started)
         controller.set_time(time.monotonic())
         events = controller.complete_inflight(
             revision,
@@ -177,43 +426,72 @@ async def entrypoint(ctx: JobContext) -> None:
             stage,
             analyzed_frame=frame,
         )
-        for event in events:
-            await speak(event.text)
+        return [event.text for event in events]
 
     def handle_user_text(text: str) -> None:
         cleaned = text.strip()
-        if not cleaned:
-            return
-        key_text = cleaned.lower()
-        if key_text in handled_texts:
+        if not cleaned or voice_state['closed']:
             return
         # Open listening as soon as audio exists so commands are not dropped
         # while waiting for chert_bridge_ready metadata.
         lifecycle.on_caller_audio(epoch)
         if lifecycle.accept_audio("caller", cleaned) is None:
             return
-        handled_texts.add(key_text)
         logger.info("user transcript: %s", cleaned[:120])
+        if cleaned.lower().strip(' .!?') in {'repeat setup code','repeat the setup code'} and voice_state['setup_code']:
+            turns.submit(announce_setup_code(voice_state['setup_code']))
+            return
         classifier = _get_intent_classifier()
+        command=profile_entry.consume(cleaned)
+        if command is not None:
+            async def change_voice():
+                await session.interrupt(force=True)
+                await voice_command(command)
+            turns.submit(change_voice())
+            return
 
-        def classify():
-            return classifier.route(cleaned, controller.task, pending_prompt_id)
+        # Backchannels must not replace an answer already being generated/spoken.
+        immediate = classifier.route(cleaned, controller.task, pending_prompt_id)
+        if immediate.kind == IntentKind.SOCIAL and turns.task is not None and not turns.task.done():
+            return
+        conversation_history.append({"role": "user", "text": cleaned})
+        del conversation_history[:-6]
 
         async def route_and_act() -> None:
-            loop = asyncio.get_running_loop()
-            intent = await loop.run_in_executor(None, classify)
+            intent = immediate
             logger.info("routed intent: %s", intent.kind.value)
+            if intent.kind != IntentKind.SOCIAL:
+                await session.interrupt(force=True)
+            if intent.kind == IntentKind.SOCIAL:
+                greeting = cleaned.lower().strip(' .!?') in {"hello", "hi", "hey", "привет"}
+                await speak("I'm here. What would you like me to look at?" if greeting else "Okay. What would you like to know?")
+                return
+            if intent.kind == IntentKind.CONVERSATION:
+                controller.task.analysis_revision += 1
+                controller.inflight_revision = None
+                await run_conversation(cleaned)
+                return
             controller.set_time(time.monotonic())
             events = controller.handle(intent)
-            for event in events:
-                await speak(event.text)
+            if intent.kind in {IntentKind.SLOWER, IntentKind.FASTER}:
+                apply_voice(voice_state['preferences'].model_copy(update={'speed':controller.speed}))
+                await save_voice()
+
+            async def acknowledge():
+                for event in events:
+                    await speak(event.text)
+
             if intent.kind in {IntentKind.FIND_TARGET, IntentKind.CHANGE_TARGET, IntentKind.CHECK}:
                 revision = controller.inflight_revision
                 if revision is not None:
                     stage = "recheck" if intent.kind == IntentKind.CHECK else "candidate"
-                    await run_vision(stage, revision)
+                    results = await acknowledge_and_analyze(acknowledge(), run_vision(stage, revision))
+                    for result in results:
+                        await speak(result)
+                    return
+            await acknowledge()
 
-        asyncio.create_task(route_and_act())
+        turns.submit(route_and_act())
 
     @session.on("user_input_transcribed")
     def _on_transcript(ev) -> None:
@@ -224,9 +502,10 @@ async def entrypoint(ctx: JobContext) -> None:
         if not is_final:
             logger.info("interim transcript: %s", text[:80])
             return
-        handle_user_text(text)
+        logger.info("final STT segment: %s", text[:120])
 
     def _link_bridge(participant: rtc.RemoteParticipant) -> None:
+        nonlocal caller_task
         identity = participant.identity or ""
         if not identity.startswith("chert-bridge"):
             return
@@ -234,6 +513,14 @@ async def entrypoint(ctx: JobContext) -> None:
         if room_io_obj is not None:
             room_io_obj.set_participant(identity)
             logger.info("linked room io to %s", identity)
+        if caller_task is None and settings.database_url and len(settings.caller_link_secret)>=32:
+            call_id=identity.removeprefix('chert-bridge-')
+            try:
+                valid=str(UUID(call_id))==call_id
+            except ValueError:
+                valid=False
+            if valid:
+                caller_task=asyncio.create_task(follow_caller(call_id))
 
     def _on_participant(participant: rtc.RemoteParticipant) -> None:
         _link_bridge(participant)
@@ -248,7 +535,12 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         _link_bridge(participant)
         if name == CALLER_VIDEO_TRACK and isinstance(track, rtc.RemoteVideoTrack):
-            asyncio.create_task(_consume_video(track, buffer, epoch, sample_state))
+            if publication.sid not in subscribed_video:
+                if publication.simulcasted:
+                    publication.set_video_quality(rtc.VideoQuality.VIDEO_QUALITY_HIGH)
+                    logger.info("requested highest caller video quality for label reading")
+                subscribed_video.add(publication.sid)
+                asyncio.create_task(_consume_video(track, buffer, epoch, sample_state))
         if name == CALLER_AUDIO_TRACK or track.kind == rtc.TrackKind.KIND_AUDIO:
             lifecycle.on_caller_audio(epoch)
             logger.info("caller audio track ready")
@@ -256,22 +548,65 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.room.on("track_subscribed", _on_track)
     ctx.room.on("participant_connected", _on_participant)
 
+    def _on_disconnect(*args) -> None:
+        if voice_state['closed']:
+            return
+        turns.cancel()
+        buffer.clear()
+        lifecycle.disconnect()
+        voice_state['closed']=True
+        if refresh_task:
+            refresh_task.cancel()
+        if caller_task:
+            caller_task.cancel()
+        asyncio.create_task(telemetry.close())
+
+    ctx.room.on("disconnected", _on_disconnect)
+
+    @session.on('close')
+    def _on_session_close(ev):
+        _on_disconnect()
+
+    # Construct the provider client while the bridge is warming rather than on
+    # the first caller question. No extra inference/API request is made.
+    async def warm_vision():
+        try:
+            await asyncio.to_thread(_get_vision)
+        except Exception as error:
+            logger.warning('Vision client warmup failed: %s',type(error).__name__)
+    asyncio.create_task(warm_vision())
+
     async def wait_bridge_ready() -> None:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             meta = ctx.room.metadata or ""
             if "chert_bridge_ready" in meta:
+                if caller_task is not None and not caller_resolved.is_set():
+                    try:
+                        await asyncio.wait_for(caller_resolved.wait(),1.5)
+                    except TimeoutError:
+                        pass
                 greeting = lifecycle.on_bridge_ready(epoch)
-                if greeting:
+                if greeting and not lifecycle.transcripts:
                     await speak(greeting, interruptible=False)
                 return
             await asyncio.sleep(0.1)
         greeting = lifecycle.on_bridge_ready(epoch)
-        if greeting:
+        if greeting and not lifecycle.transcripts:
             await speak(greeting, interruptible=False)
 
+    agent=TiresiasAgent(handle_user_text)
+
+    @session.on('conversation_item_added')
+    def _on_completed_item(ev):
+        # LiveKit retains completed user messages here when uninterruptible
+        # playback bypasses on_user_turn_completed. Recover that completed turn;
+        # message IDs prevent duplicate dispatch without suppressing retries.
+        if not voice_state['closed']:
+            agent.accept_user_message(ev.item)
+
     await session.start(
-        agent=TiresiasAgent(handle_user_text),
+        agent=agent,
         room=ctx.room,
         room_input_options=room_io.RoomInputOptions(
             audio_enabled=True,
@@ -286,6 +621,10 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     for participant in ctx.room.remote_participants.values():
         _link_bridge(participant)
+        # connect() may subscribe before the event handlers were installed.
+        for publication in participant.track_publications.values():
+            if publication.track is not None:
+                _on_track(publication.track, publication, participant)
     asyncio.create_task(wait_bridge_ready())
     await _publish_status_video(ctx)
 

@@ -235,3 +235,47 @@ def test_speech_templates_stay_conversational():
         task(),
     )
     assert "That's not" in mismatch
+
+
+def test_read_without_search_target_reads_the_label():
+    decision = decide(waiting_task(), frame(), observation(), stage="recheck", now_monotonic=10.2)
+    assert decision.kind == EvidenceKind.CANDIDATE
+    assert "not" not in speech_for(decision, waiting_task()).lower()
+
+
+def test_partial_label_does_not_claim_a_different_product():
+    decision = decide(task(), frame(), observation(visible_text=["LEMON"]), stage="recheck", now_monotonic=10.2)
+    assert decision.kind == EvidenceKind.UNCERTAIN
+
+
+def test_read_camera_questions_route_without_a_network_request():
+    for text in ["what do you see", "can you read it", "try again", "how about now"]:
+        assert route_utterance(text, waiting_task()).kind == IntentKind.CHECK, text
+
+
+def test_find_product_does_not_require_container_words_on_the_label():
+    intent = route_utterance("find me a Pepsi can", waiting_task())
+    assert intent.target.requested_label == "pepsi can"
+    assert intent.target.required_terms == ["pepsi"]
+    current = task().model_copy(update={"target": intent.target})
+    result = decide(current, frame(), observation(visible_text=["PEPSI"]), stage="recheck", now_monotonic=10.2)
+    assert result.kind == EvidenceKind.MATCH
+
+
+def test_generic_target_keeps_at_least_one_required_term():
+    intent = route_utterance("find a bottle", waiting_task())
+    assert intent.target.required_terms == ["bottle"]
+
+
+def test_product_words_must_match_whole_words_not_substrings():
+    current = waiting_task()
+    current.target = route_utterance("find oat milk", current).target
+    result = decide(current, frame(), observation(visible_text=["GOAT MILK"]), stage="recheck", now_monotonic=10.2)
+    assert result.kind != EvidenceKind.MATCH
+
+
+def test_punctuation_and_case_do_not_prevent_a_word_match():
+    current = waiting_task()
+    current.target = route_utterance("find oat milk", current).target
+    result = decide(current, frame(), observation(visible_text=["OAT-MILK"]), stage="recheck", now_monotonic=10.2)
+    assert result.kind == EvidenceKind.MATCH

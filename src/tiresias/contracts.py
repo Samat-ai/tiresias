@@ -23,6 +23,8 @@ class IntentKind(str, Enum):
     CONSENT_ACCEPT = "CONSENT_ACCEPT"
     CONSENT_DECLINE = "CONSENT_DECLINE"
     ASK_CLARIFICATION = "ASK_CLARIFICATION"
+    CONVERSATION = "CONVERSATION"
+    SOCIAL = "SOCIAL"
     UNSUPPORTED = "UNSUPPORTED"
 
 
@@ -187,6 +189,12 @@ class Observation(StrictModel):
     camera_position: CameraPosition = CameraPosition.UNKNOWN
     match_proposal: MatchProposal = MatchProposal.UNKNOWN
     response_candidate: str = Field(default="", max_length=300)
+
+
+class GroundedReply(StrictModel):
+    text: str = Field(min_length=1, max_length=400)
+    frame_id: Optional[str] = None
+    needs_view: bool = False
 
 
 class EvidenceDecision(StrictModel):

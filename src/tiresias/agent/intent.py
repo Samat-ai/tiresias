@@ -9,6 +9,7 @@ from google import genai
 from google.genai import types
 
 from tiresias.agent.policy import _excluded, _target_from_label, route_utterance
+from tiresias.agent.google_backend import create_client
 from tiresias.contracts import IntentKind, TaskContext, UserIntent
 
 logger = logging.getLogger("tiresias.agent.intent")
@@ -36,18 +37,16 @@ _SCHEMA_HINT = {
 
 
 class IntentClassifier:
-    """Gemini text intent classifier with heuristic fallback via route_utterance."""
+    """Route controls locally; send other questions to grounded conversation."""
 
-    def __init__(self, api_key: str = "", model: str = "", timeout_seconds: float = 10.0) -> None:
+    def __init__(self, api_key: str = "", model: str = "", timeout_seconds: float = 10.0,
+                 *, vertexai: bool = False, project: str = "", location: str = "global") -> None:
         self.model = model or DEFAULT_MODEL
         # Gemini rejects http deadlines under 10s.
         self.timeout_seconds = max(float(timeout_seconds), 10.0)
+        self._api_key = api_key
+        self._backend = dict(vertexai=vertexai, project=project, location=location)
         self._client: genai.Client | None = None
-        if api_key:
-            self._client = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(api_version="v1beta"),
-            )
 
     def route(
         self,
@@ -58,7 +57,7 @@ class IntentClassifier:
         raw = text.strip()
         if not raw:
             return UserIntent(kind=IntentKind.ASK_CLARIFICATION, transcript=raw)
-        norm = re.sub(r"\s+", " ", raw.lower())
+        norm = re.sub(r"\s+", " ", raw.lower()).strip(' .!?')
         if _excluded(norm):
             return UserIntent(kind=IntentKind.UNSUPPORTED, transcript=raw)
 
@@ -67,24 +66,30 @@ class IntentClassifier:
         if control is not None:
             return control
 
+        if norm.strip(' .!?') in {
+            'yes', 'yeah', 'yep', 'okay', 'ok', 'sure', 'no', 'no thanks',
+            'hello', 'hi', 'hey', 'hello there', 'thanks', 'thank you',
+            'да', 'нет', 'привет', 'спасибо', 'хорошо',
+        }:
+            return UserIntent(kind=IntentKind.SOCIAL, transcript=raw)
+
+        # Do not turn non-English questions into the bare-noun product shortcut.
+        if re.search(r'[а-яё]', norm):
+            return UserIntent(kind=IntentKind.CONVERSATION, transcript=raw)
+
         # Prefer fast heuristics for clear find/check/change so vision is not
         # blocked behind a second Gemini round-trip on every turn.
         heuristic = route_utterance(raw, task, pending_prompt_id)
         if heuristic.kind != IntentKind.ASK_CLARIFICATION:
             return heuristic
 
-        if self._client is not None:
-            try:
-                classified = self._classify_gemini(raw, task)
-                if classified is not None:
-                    return classified
-            except Exception:
-                logger.exception("gemini intent classify failed; using heuristic")
-
-        return heuristic
+        # Unknown questions go directly to one grounded multimodal request.
+        # A text-only classifier must never invent sharing/consent or refusals.
+        return UserIntent(kind=IntentKind.CONVERSATION, transcript=raw)
 
     def _classify_gemini(self, raw: str, task: TaskContext | None) -> UserIntent | None:
-        assert self._client is not None
+        if self._client is None:
+            self._client = create_client(self._api_key, **self._backend)
         has_target = bool(task and task.target)
         current = task.target.requested_label if task and task.target else None
         prompt = (
@@ -100,10 +105,13 @@ class IntentClassifier:
             model=self.model,
             contents=[prompt],
             config=types.GenerateContentConfig(
-                temperature=0,
                 response_mime_type="application/json",
-                max_output_tokens=96,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                max_output_tokens=256,
+                thinking_config=(
+                    types.ThinkingConfig(thinking_level="minimal")
+                    if self.model.startswith("gemini-3")
+                    else types.ThinkingConfig(thinking_budget=0)
+                ),
                 http_options=types.HttpOptions(timeout=int(self.timeout_seconds * 1000)),
             ),
         )

@@ -1,0 +1,155 @@
+# Completion ledger — plan: docs/superpowers/plans/2026-11-15-deadline-completion.md
+
+## Baseline
+
+- Owner confirmed the initial Devpost entry was submitted.
+- Owner confirmed the new conversation flow works much better on FaceTime.
+- 94 tests passed; real pipeline counting/backchannel/follow-up tests passed.
+- Remaining account resources not configured: Grok Bot destination, Solana
+  treasury/recipient. Tiger Data is connected and the Vultr VM is accessible.
+  Continue local implementation
+  while these are provisioned; do not claim external integration without evidence.
+
+## Rulings
+
+- Ruling: Keep the existing working directory and move edits to a development
+  branch rather than copying into another worktree — the live worker and virtual
+  environment are anchored here and contain the verified rescue. No source or
+  user edits are discarded; changing this assumption would complicate restart.
+- Ruling: Add voice settings as a complete dashboard slice before the remaining
+  sponsor tasks — the user explicitly requested persistent voice/tone selection.
+- Ruling: A spoken profile code links voice preferences only. It is not caller
+  authentication and must never authorize private review access or payments.
+- Ruling: Use a separate local application DB for durable development settings;
+  retain the isolated test DB. A local Timescale instance is not proof of a
+  hosted Tiger Data integration. DATABASE_URL can later target Tiger Data.
+- Ruling: Retain the Python/FastAPI architecture and Vultr hosting plan; do not
+  create an unrelated Sites/Cloudflare deployment.
+
+## Active work
+
+- Voice preferences: validated models, durable storage, web account UI,
+  voice preview, call profile selection and live voice/tone commands.
+- Telemetry: bounded asynchronous stage writes and dashboard latency queries.
+
+## Verified on November 15, approximately 02:28 CST
+
+- Full suite: `python -m pytest -q` -> **113 passed**, 17.70 seconds.
+- Hosted Tiger Data: migrations applied, Timescale extension/hypertable present;
+  real pipeline telemetry includes two conversation requests at 2221/1116 ms
+  and speech generation first audio at approximately 145–178 ms. Playback
+  duration includes the spoken answer and must not be called response latency.
+- Saved Sarah/friendly/0.85 settings through the local web UI; actual preview
+  returned MP3. A real-provider LiveKit smoke call loaded the saved profile by
+  spoken digits and correctly counted two Pepsi cans in both follow-up tests.
+- Vultr VM `45.76.239.245`: pinned-key SSH works, Ubuntu 24.04, one CPU,
+  approximately 2 GB RAM, fresh host, UFW initially permits SSH only.
+- Prepared source-allowlist deployment, unprivileged systemd web service, Caddy
+  HTTPS and operation/rollback instructions. No credentials are embedded in
+  these source files or the release archive.
+- The user explicitly approved copying the Tiger Data credential and ElevenLabs
+  key to this VM after the automatic review asked for that authorization.
+  Deployment then completed; the environment file is mode 0640, root:tiresias.
+- Human helper flow, real Solana transaction and Grok Bot are still unproven.
+
+## Vultr deployment and domain, approximately 02:38 CST
+
+- Public web service deployed and independently browser-tested: registration,
+  account-scoped preferences saved/reloaded, real ElevenLabs MP3 preview
+  (HTTP 200, 12033 bytes, 576 ms), live Tiger Data performance dashboard,
+  and mobile layout with six available voices. QA used a separate test account.
+- Current release: `20261115t083404z`; source archive SHA256
+  `bf6f62c08212d2dca2327421e846a86db9f75911c55abd864003d8c032d30208`.
+- Main URL: **https://tiresias.ink**. Also configured `www.tiresias.ink` and
+  `45.76.239.245.sslip.io` as HTTPS aliases. Caddy and tiresias-web are active.
+- User configured Porkbun: root A -> `45.76.239.245`, www CNAME -> `tiresias.ink`,
+  TTL 600. Verified both against authoritative Porkbun and public resolvers.
+  After server DNS cache refresh, both root/www HTTPS health endpoints returned
+  HTTP 200 with certificate validation enabled (no insecure TLS bypass).
+  Some client DNS caches still hold the deleted parking/NODATA records, so
+  browser access to the new domain may lag public DNS until those expire.
+- First redeploy encountered Ubuntu unattended-upgrade's package lock. The
+  provisioner now skips installed dependencies and waits for the lock when
+  installation is actually required. A subsequent deployment passed.
+- FaceTime bridge and Gemini/voice worker remain local; keep them running for
+  calls. Web deployment alone does not make calls independent of this computer.
+
+## Profile command repair, approximately 02:51 CST
+
+- Actual handset logs showed “Use profile.” routed as FIND_TARGET because no
+  digits followed it in the same completed turn. A later complete code was
+  retained by LiveKit during uninterruptible playback but never delivered to
+  `on_user_turn_completed`.
+- Added bounded profile entry across turns: bare command prompts for eight
+  digits; partial groups/fillers are parsed; complete code repeats replace the
+  partial entry. Cancel, topic change and a 45-second expiry clear entry state.
+  Only a complete eight-digit code reaches the database lookup.
+- Recover completed user messages from LiveKit's public
+  `conversation_item_added` event. Deduplicate by message ID across that event
+  and the normal completed-turn hook; raw STT remains diagnostic only. This
+  preserves backchannel protection and legitimate identical-command retries.
+- Six regression tests failed before the change and passed afterward. Full
+  suite: **119 passed**, 30.56 seconds. Restarted the local worker with the fix;
+  current logs: `data/worker-profile-fix.stdout.log` / `.stderr.log`.
+- Real-provider smoke (`--conversation --backchannel --profile-paused
+  --profile-code <QA-code>`) passed: output transcribed as “Say the eight digits
+  ... I have four digits ... Your saved voice preferences are loaded.” Both
+  subsequent counting questions returned two Pepsi cans despite “yes” during
+  output. Test excludes Chert/handset; owner should retry their actual call.
+  Artifact: `data/profile-paused-smoke-results.json` (ignored).
+- Owner confirmed `https://tiresias.ink` works on the phone's mobile data;
+  their public Wi-Fi could not open it. DNS, TLS and service were independently
+  checked. Do not treat that network failure as a local-only deployment.
+
+## Caller-linked preferences — implementation in progress
+
+- Owner requested one-time setup and automatic settings by phone number,
+  avoiding a long spoken profile code on every call.
+- Verified authenticated Chert GET call API returns `from: {type, value}` for
+  this project's real calls. Only field names/types were logged; credentials
+  and caller values were omitted. Chert's bridge participant ID identifies the
+  exact call UUID; provider response must match project, inbound/live state and
+  a recent creation time before its caller handle is used.
+- Ruling: link voice preferences with an inbound spoken four-digit challenge
+  entered on the signed-in website once — this proves control without SMS or
+  reading a code aloud. Caller binding selects preferences only, never private
+  review/payment access. Store keyed handle fingerprints and masked displays;
+  do not reuse legacy XOR phone storage. Cost: setup still needs one brief call
+  and entering four heard digits on the site.
+- Separate additive migration 004 has been applied to hosted Tiger Data. A new
+  random `CALLER_LINK_SECRET` was generated in local ignored configuration;
+  it must also be deployed in the restricted web-service environment. Chert
+  credentials remain only on this computer.
+- Tests watched fail then pass for DB linking, authenticated provider lookup,
+  CSRF/account isolation, persistent failed-code attempts, unlink, runtime
+  setup speech and automatic loading on two separate fake calls without STT.
+  Full suite: **136 passed**, 47.22 seconds. Fresh code review is in progress.
+- Real handset link/second-call verification is still outstanding. Do not claim
+  the real caller auto-load path is proven by fake/runtime tests.
+
+### Fresh caller-link review and fix pass
+
+- Reviewer found three Important issues. All were reproduced by failing tests:
+  confirmation racing unlink could preserve a link; delayed profile refresh
+  could restore settings after unlink; setup speech included digits in logs and
+  Gemini history. Fixed with consistent per-user DB locking, revision checks
+  after asynchronous reads, and private setup speech excluded from logs and both
+  application/SDK chat histories. Full suite after fixes: 139 passed.
+- Minor deferred: explicitly asking to repeat a setup code can repeat an already
+  expired/confirmed code. Verification still rejects it; starting setup again
+  is the recovery. No authentication or preference selection is authorized by
+  that stale code.
+- Browser verification caught cached old JavaScript after deployment. Added
+  content-derived asset URLs; regression changes a script and confirms a new
+  URL is rendered for an existing signed-in session. Caller forms now use POST
+  even when script loading fails, keeping caller handles out of query strings.
+- Worker restarted with caller linking enabled. The actual-provider normal
+  conversation/backchannel smoke passed both checks after this restart.
+- Final suite: **140 passed**, 57.23 seconds. JavaScript syntax and tracked diff
+  whitespace checks pass. Final public release `20261115t093820z`, archive SHA256
+  `33e3006141eb2091e87dca88b5ac5c4add1ccd20598dbd41b424a58d8979dbb4`.
+  Browser verified the new content-derived script URL, phone-sized layout,
+  authenticated setup request, masked response, and cancellation through the
+  actual public app. QA used a fictional 555 number; no phone call/SMS was sent.
+  Normal HTTPS health returns 200. Owner was given the one-time setup steps;
+  real setup and second-call auto-loading remain the explicit final handset gate.

@@ -1,5 +1,60 @@
 # Tiresias R0 — agent handoff
 
+> **Automatic caller settings:** 140 tests pass. One-time caller linking is
+> implemented with the live Chert authenticated call API, separate voice-only
+> bindings in Tiger Data, and a four-digit code spoken by the worker and entered
+> on the signed-in website. Future calls from a verified identity auto-load
+> preferences. No raw caller number is persisted, and the Chert credential stays
+> local. Fresh review found/fixed concurrent unlink, late-refresh and code-history
+> issues. Website controls are under “Remember me next time”; real handset setup
+> and second-call verification remain pending. The current worker logs are
+> `data/worker-caller-links.stdout.log` / `.stderr.log`.
+
+> **Profile hotfix:** 119 tests pass. “Use profile” can now be said first, then
+> digits across separate turns. A public LiveKit completed-message event recovers
+> commands previously skipped during uninterruptible playback, with message-ID
+> deduplication. A real-provider paused/overlapping profile test loaded saved
+> settings, and both counting/backchannel follow-ups passed. Local worker was
+> restarted; current logs are `data/worker-profile-fix.stdout.log` / `.stderr.log`.
+> Owner confirmed the public website works on mobile data (public Wi-Fi failed).
+
+> **Latest deployment/voice update:** 113 tests pass. The owner confirmed the
+> improved conversation works on a real FaceTime call. Persistent voice, tone
+> and speed settings are live at **https://tiresias.ink**, hosted on the owner's
+> Vultr VM with verified HTTPS. Both web and local worker use hosted Tiger Data;
+> account preferences, a real ElevenLabs preview and real pipeline stage records
+> were verified. Say “Use profile” followed by the eight digits shown in your
+> account to select its voice during a call. This code is not authentication.
+> Keep the local Chert bridge and voice worker running. Human review, real Solana
+> transfers and Grok Bot remain unfinished. See [deploy/README.md](../deploy/README.md)
+> and [IMPLEMENTATION-LEDGER.md](IMPLEMENTATION-LEDGER.md) for current evidence.
+> Older updates below describe earlier stages of the rescue.
+
+> **Latest conversational fix:** 94 tests pass. The owner's real FaceTime call
+> delivered 1280×720 frames and read Pepsi, but a counting question misrouted to
+> ASK_PERSON. Raw STT dispatch/forced interruption caused turn collisions. Main
+> now uses completed turns, server VAD + STT endpointing, a quiet gate, backchannel
+> protection and direct image-question answers with short context. Automatic VAD
+> interruption is disabled; completed meaningful utterances explicitly interrupt
+> while input stays open during playback. Counting two Pepsi cans with a person
+> in view passed real-provider tests, including a continuous-mic overlap test
+> with “yes” during playback and a successful repeated follow-up question.
+> Retest actual handset conversation. Human review/sponsor integrations remain missing.
+
+> **Latest audit:** [PROGRESS-AUDIT.md](PROGRESS-AUDIT.md) compares the Downloads
+> blueprint/slides with the code and all eight selected tracks. All 77 tests pass.
+> Real isolated LiveKit/STT/vision/TTS tests returned correct label audio on two
+> repeated checks in each of two runs. Actual Chert handset verification remains
+> pending. Whole-word product matching was corrected; small-label input resolution
+> remains unresolved. See the linked deadline implementation plan in the audit.
+
+> **November 15 rescue update:** Read [RESCUE.md](RESCUE.md) first. Vertex AI
+> with existing local ADC now works: real generated-label probe returned a correct
+> MATCH in 2.26s. `.env.local` selects Vertex/global instead of depleted AI Studio
+> prepay. Repeated-command, cancellation, image freshness and latency fixes are
+> implemented. All 75 tests passed. A real FaceTime call is still required.
+> Historical status below predates these fixes.
+
 Dense continuation doc for a **new agent** with no prior chat context.  
 Repo: `C:\Users\samat\Documents\Cursor\tiresias` · Windows · Python 3.13 · PowerShell · venv `.venv`.
 

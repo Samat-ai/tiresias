@@ -83,16 +83,21 @@ class TaskController:
                 self.task.state = TaskState.RECHECK_SELECTION
             return self._analyze(observation_factory, stage="recheck", explicit_check=True)
         if intent.kind == IntentKind.ASK_PERSON:
-            self.task.state = TaskState.REVIEW_CONSENT
-            self.consent_prompt_id = new_id()
             return self._say(
-                "I can ask someone to look. Say yes if you want to share this view.",
+                "A live helper isn't connected yet. I can take another look with you.",
                 visual=False,
                 priority=20,
             )
         if intent.kind == IntentKind.ASK_CLARIFICATION:
             return self._say(clarification_speech(self.task), visual=False, priority=40)
         return []
+
+    def conversational_reply(self, reply, frame=None) -> list[SpeechEvent]:
+        return self._say(
+            reply.text, visual=frame is not None,
+            frame_id=frame.frame_id if frame else None,
+            scene_epoch=frame.scene_epoch if frame else None,
+        )
 
     def complete_inflight(
         self,

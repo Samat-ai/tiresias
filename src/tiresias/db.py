@@ -26,8 +26,8 @@ def test_database_url() -> str:
     return url
 
 
-def connect(url: str | None = None):
-    return psycopg.connect(url or test_database_url(), row_factory=dict_row)
+def connect(url: str | None = None, *, connect_timeout: int = 5):
+    return psycopg.connect(url or test_database_url(), row_factory=dict_row, connect_timeout=connect_timeout)
 
 
 def migrate(url: str | None = None) -> None:

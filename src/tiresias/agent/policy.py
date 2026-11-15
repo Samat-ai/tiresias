@@ -29,7 +29,7 @@ EXCLUDED_PATTERNS = (
 INSTRUCTION_MARKERS = ("ignore rules", "ignore previous", "system prompt", "you are now")
 
 _META_OR_GREETING = re.compile(
-    r"\b(?:what|who|why|how|hello|hi|hey|thanks|thank|please|ok|okay|sure|"
+    r"\b(?:what|who|why|how|where|when|is|are|do|does|hello|hi|hey|thanks|thank|please|ok|okay|sure|"
     r"yeah|yep|yes|no|nope|uhm|um|uh)\b"
 )
 _HELP_SEEING = re.compile(
@@ -53,6 +53,10 @@ _CHECK = re.compile(
     r"|what am i (?:holding|looking at)"
     r"|does this (?:match|say)"
     r"|take a look"
+    r"|what (?:do|can) you see"
+    r"|can you read (?:it|this|that)"
+    r"|try again"
+    r"|how about now"
     r")\b"
 )
 _ASK_PERSON = re.compile(
@@ -85,7 +89,7 @@ _CHANGE = re.compile(
 def route_utterance(text: str, task: TaskContext | None, pending_prompt_id: str | None = None) -> UserIntent:
     """Heuristic intent router (also used as Gemini fallback)."""
     raw = text.strip()
-    norm = re.sub(r"\s+", " ", raw.lower())
+    norm = re.sub(r"\s+", " ", raw.lower()).strip(' .!?')
     if _excluded(norm):
         return UserIntent(kind=IntentKind.UNSUPPORTED, transcript=raw)
     if norm in {"stop", "stop talking", "quiet", "cancel"} or norm.startswith("stop "):
@@ -144,7 +148,7 @@ def clarification_speech(task: TaskContext | None) -> str:
 def _clean_label(label: str) -> str:
     cleaned = label.strip(" .,!?")
     cleaned = re.sub(
-        r"^(?:the |a |an |my |some |for me |please |this |that )+",
+        r"^(?:the |a |an |my |some |for me |me |please |this |that )+",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -156,6 +160,11 @@ def _clean_label(label: str) -> str:
 def _target_from_label(label: str) -> TargetSpec:
     cleaned = _clean_label(label) or label.strip()[:200]
     terms = [part for part in re.split(r"[^a-z0-9]+", cleaned.lower()) if len(part) > 2][:10]
+    # Packaging describes the object, but is usually absent from its printed name.
+    name_terms = [term for term in terms if term not in {
+        "can", "bottle", "box", "package", "carton", "jar", "tin", "bag", "packet",
+    }]
+    terms = name_terms or terms
     return TargetSpec(requested_label=cleaned[:200], required_terms=terms)
 
 
@@ -227,11 +236,16 @@ def decide(
 
     # Soft model hedges (glare/motion) must not discard quoted label text.
     base["visible_text"] = usable_text
-    if stage != "recheck":
+    if stage != "recheck" or task.target is None:
         return EvidenceDecision(kind=EvidenceKind.CANDIDATE, reason="candidate stage cannot match", **base)
     observation_with_text = observation.model_copy(update={"visible_text": usable_text})
     if _terms_present(task, observation_with_text) and not _excluded_terms_visible(task, observation_with_text):
         return EvidenceDecision(kind=EvidenceKind.MATCH, reason="readable recheck label", **base)
+    blob = " ".join(usable_text).lower()
+    if not _excluded_terms_visible(task, observation_with_text) and any(
+        _contains_term(blob, term) for term in task.target.required_terms
+    ):
+        return EvidenceDecision(kind=EvidenceKind.UNCERTAIN, reason="partial target text", **base)
     return EvidenceDecision(kind=EvidenceKind.MISMATCH, reason="visible contradiction", **base)
 
 
@@ -249,14 +263,18 @@ def _terms_present(task: TaskContext, observation: Observation) -> bool:
     if task.target is None:
         return False
     blob = " ".join(observation.visible_text).lower()
-    return all(term.lower() in blob for term in task.target.required_terms)
+    return bool(task.target.required_terms) and all(_contains_term(blob, term) for term in task.target.required_terms)
+
+
+def _contains_term(blob: str, term: str) -> bool:
+    return bool(re.search(r"(?<!\w)" + re.escape(term.lower()) + r"(?!\w)", blob))
 
 
 def _excluded_terms_visible(task: TaskContext, observation: Observation) -> bool:
     if task.target is None:
         return False
     blob = " ".join(observation.visible_text).lower()
-    return any(term.lower() in blob for term in task.target.excluded_terms)
+    return any(_contains_term(blob, term) for term in task.target.excluded_terms)
 
 
 def speech_for(decision: EvidenceDecision, task: TaskContext) -> str:
@@ -268,6 +286,8 @@ def speech_for(decision: EvidenceDecision, task: TaskContext) -> str:
         return f"That's not {label}. Show me the one you meant."
     if decision.kind == EvidenceKind.CANDIDATE:
         if shown:
+            if task.target is None:
+                return f"The label says {shown}."
             return f"I can see {shown}. Hold the name still and say check this."
         return f"Might be {label}. Hold the name still and say check this."
     if decision.kind == EvidenceKind.NEED_VIEW:
@@ -278,4 +298,6 @@ def speech_for(decision: EvidenceDecision, task: TaskContext) -> str:
         return "I can't help with dosing or crossing. I can read a regular product label though."
     if decision.reason == "evidence expired":
         return "That view's gone. Hold it still and try again."
+    if decision.reason == "partial target text":
+        return f"I can read {shown}, but not the rest of the name yet. Turn the label toward the camera."
     return "Not sure on this one. Hold it steady, or ask a person."
