@@ -11,11 +11,12 @@ Reviewed during R0 setup. Do not paste secrets here.
 | Chert-managed LiveKit keys | BLOCKED | Still `livekit_not_provisioned`; using own LiveKit project instead. |
 | ElevenLabs key in `.env.local` | WORKING | Onboarded; key present; not logged here. |
 | Agent worker `tiresias-agent` | WORKING | Registered and handling FaceTime jobs when process is up. |
-| Gemini image/schema probe | WORKING | `GEMINI_API_KEY` present; default model `gemini-3.5-flash-lite` (2.5 removed from AI Studio UI; API still lists 2.5 for legacy keys). |
-| Gemini text intent classify | PARTIAL | Live calls sometimes get `400 INVALID_ARGUMENT`; heuristic `route_utterance` fallback still works. |
+| Gemini image/schema probe | WORKING | Offline probe succeeded with `gemini-3.5-flash-lite` (2.5 removed from AI Studio UI). Default in code when `GEMINI_MODEL` empty. |
+| Gemini live vision analyze | BROKEN/PARTIAL | FaceTime path recently logged `400 INVALID_ARGUMENT` on `analyze_frame` (same class of error as intent). Fix before demo. |
+| Gemini text intent classify | PARTIAL | Live calls get `400 INVALID_ARGUMENT`; heuristic `route_utterance` fallback still routes find/check. |
 | Caller video track `facetime-remote-video` | WORKING | Frames ingested during FaceTime Video; status video published. |
 | Bridge-ready greeting / TTS | PARTIAL | Greets after `chert_bridge_ready`; Chert has also logged `no_audio` on some calls — confirm TTS track after restart. |
-| Find → vision → check loop | PARTIAL | Wired in agent; needs a clean demo rehearsal after restarts (see `docs/HANDOFF.md`). |
+| Find → vision → check loop | PARTIAL | Wired end-to-end; blocked on live Gemini 400 until fixed (see `docs/HANDOFF.md`). |
 | Review portal / Atlas / Vultr / Grok | PENDING | Library/tests exist for auth/reviews/outbox/rewards; no FastAPI portal, Atlas wiring, Vultr deploy, or Grok webhook script yet. |
 
 ## Next human actions
