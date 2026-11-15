@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 from tiresias.config import Settings
 
 
-async def main(*, conversation: bool = False, backchannel: bool = False, profile_code: str = '', profile_paused: bool = False, states: bool = False) -> None:
+async def main(*, conversation: bool = False, backchannel: bool = False, profile_code: str = '', profile_paused: bool = False, states: bool = False, warm_room: bool = False) -> None:
     settings = Settings()
     room_name = f"tiresias-smoke-{uuid4().hex[:10]}"
     service = api.LiveKitAPI(settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret)
@@ -31,13 +31,15 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
     tasks = []
     received = bytearray()
     audio_ready = asyncio.Event()
-    result = {"room": room_name, "scope": "LiveKit + ElevenLabs STT/TTS + Vertex vision; excludes FaceTime"}
+    result = {"room": room_name, "scope": "LiveKit + ElevenLabs STT/TTS + Vertex vision; excludes FaceTime", "warm_room_without_ready_metadata":warm_room}
     video_state={'frames':0,'digests':set(),'image':None,'last_sample':0}
+    video_ready=asyncio.Event()
 
     async def consume_video(track):
         stream=rtc.VideoStream(track,format=rtc.VideoBufferType.RGB24,capacity=1)
         try:
             async for event in stream:
+                video_ready.set()
                 video_state['frames']+=1
                 now=time.monotonic()
                 if now-video_state['last_sample']<0.4:
@@ -145,7 +147,7 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
                 yes.raise_for_status()
                 backchannel_audio = yes.content
             await service.room.create_room(api.CreateRoomRequest(
-                name=room_name, metadata=json.dumps({"chert_bridge_ready": True}),
+                name=room_name, metadata=json.dumps({'chert_warm':True} if warm_room else {"chert_bridge_ready": True}),
                 empty_timeout=60,
             ))
             token = api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret).with_identity(
@@ -206,7 +208,18 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
                 room=room_name, agent_name=settings.agent_name,
             ))
             print("isolated room dispatched:", room_name, flush=True)
-            await asyncio.wait_for(audio_ready.wait(), 30)
+            if warm_room:
+                await asyncio.wait_for(video_ready.wait(),20)
+                await asyncio.sleep(2)
+                result['greeting_before_ready']=audio_ready.is_set()
+                if audio_ready.is_set():
+                    raise RuntimeError('Agent spoke before the explicit Chert ready signal')
+                ready_sent=time.monotonic()
+                await service.room.update_room_metadata(api.UpdateRoomMetadataRequest(
+                    room=room_name,metadata=json.dumps({'chert_bridge_ready':True})))
+            await asyncio.wait_for(audio_ready.wait(), 10 if warm_room else 30)
+            if warm_room:
+                result['first_audio_after_ready_seconds']=round(time.monotonic()-ready_sent,3)
             if states:
                 await asyncio.sleep(2)
                 save_video_sample('greeting')
@@ -283,7 +296,7 @@ async def main(*, conversation: bool = False, backchannel: bool = False, profile
             await service.room.delete_room(api.DeleteRoomRequest(room=room_name))
         finally:
             await service.aclose()
-            name = 'call-states-smoke-results.json' if states else ('profile-paused-smoke-results.json' if profile_paused else ('backchannel-smoke-results.json' if backchannel else ('conversation-smoke-results.json' if conversation else 'live-smoke-results.json')))
+            name = 'warm-room-smoke-results.json' if warm_room else ('call-states-smoke-results.json' if states else ('profile-paused-smoke-results.json' if profile_paused else ('backchannel-smoke-results.json' if backchannel else ('conversation-smoke-results.json' if conversation else 'live-smoke-results.json'))))
             path = Path('data') / name
             path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     if not result.get("passed"):
@@ -297,9 +310,10 @@ if __name__ == "__main__":
     parser.add_argument('--profile-code',default='',help='Load an existing saved voice profile before checking the image')
     parser.add_argument('--profile-paused',action='store_true',help='Enter the profile code across pauses and during spoken instructions')
     parser.add_argument('--states',action='store_true',help='Interrupt the greeting with Stop talking and verify audible feedback and animated video')
+    parser.add_argument('--warm-room',action='store_true',help='Warm silently, then publish the explicit Chert readiness signal')
     args = parser.parse_args()
     if args.profile_code and (not args.profile_code.isdigit() or len(args.profile_code)!=8):
         parser.error('profile code must contain eight digits')
     if args.profile_paused and not args.profile_code:
         parser.error('--profile-paused requires --profile-code')
-    asyncio.run(main(conversation=args.conversation, backchannel=args.backchannel,profile_code=args.profile_code,profile_paused=args.profile_paused,states=args.states))
+    asyncio.run(main(conversation=args.conversation, backchannel=args.backchannel,profile_code=args.profile_code,profile_paused=args.profile_paused,states=args.states,warm_room=args.warm_room))

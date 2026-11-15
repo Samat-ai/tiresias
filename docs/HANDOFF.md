@@ -1,5 +1,15 @@
 # Tiresias R0 — agent handoff
 
+> **Current bridge recovery:** 192 tests pass. Chert must stay running for calls.
+> A failed handset attempt had `remote_audio_timeout` and a greeting at the old
+> 30-second fallback. The restarted bridge is connected. Greeting now requires
+> an explicit true ready flag, with a bounded server-metadata lookup after caller
+> audio arrives; no greeting is inferred from a join or an elapsed timer. Bridge
+> disconnect cancels pending work and shuts down SDK audio without draining.
+> Actual delayed-ready integration: no early speech, first audio **0.623 s** after
+> readiness, stop cue, two label reads and animated video all passed. Active logs:
+> `data/worker-bridge-readiness-v2.stdout.log` / `.stderr.log`.
+
 > **Current accessible states/avatar:** 187 tests pass. Sparse spoken cues,
 > acknowledged Stop/Wait/Hold on, generation-owned listening/thinking/speaking
 > states, and a Higgsfield-generated character are active on the normal worker.

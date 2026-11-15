@@ -260,3 +260,33 @@
 - Activated normal worker, logs `data/worker-accessible-states.*.log`. Full
   behavior/provenance/evidence in docs/CALL-STATES.md. Owner handset echo/animation
   check remains pending; no new Chert settings are needed.
+
+## No-answer / bridge recovery
+
+- Owner reported no answer, then observed Chert dev had gone down. The local
+  bridge processes subsequently changed to a new running connection; doctor
+  confirmed this account's existing line lease, service session and remote Mac
+  were available. Did not take over or replace the restored bridge.
+- Chert call diagnostics confirmed a failed attempt with
+  `terminal_detail=remote_audio_timeout`. Worker greeting was logged at its
+  30-second fallback after caller audio arrived much earlier. Server room metadata
+  was later observed ready; exact cause/timing of the missed local flag was not
+  conclusively isolated. Added a bounded server-read backup, not a claim that an
+  SDK cache bug was proven.
+- Ruling: preserve the pinned Chert CLI contract: only the explicit true
+  `chert_bridge_ready` flag authorizes greeting. A prototype using caller-track
+  readiness directly was rejected after reading that contract and was never
+  activated. Tests now assert no speech on joined audio or a false readiness
+  flag. After caller audio, bounded ListRooms queries can recover server readiness
+  when the RTC view is stale. The old timed fallback is removed.
+- Bridge participant disconnect immediately cancels greeting/warmup work and
+  invokes public SDK shutdown(drain=False). Review caught that cancelling a say
+  awaiter alone does not stop SDK-owned audio on transport failures; a new failing
+  regression was fixed. All new recovery regressions were watched RED->GREEN.
+- Full suite **192 passed**, 36.72 s. Actual normal-worker delayed-ready test:
+  no speech before ready; first audio **0.623 s** after the signal; early stop cue
+  and both LEMON label reads passed. Video: 472 frames / 116 distinct samples at
+  480x640. Evidence: `data/warm-room-smoke-results.json` (synthetic LiveKit media,
+  excludes handset/FaceTime). Active worker logs `data/worker-bridge-readiness-v2.*.log`.
+- Final handset redial remains the owner check. The website is unaffected; both
+  the local agent worker and Chert dev are needed for FaceTime calls.

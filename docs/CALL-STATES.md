@@ -1,5 +1,13 @@
 # Accessible call states and Tiresias artwork
 
+Latest recovery: see the top of HANDOFF.md. Greeting requires Chert's explicit
+true readiness flag. The worker now checks server room metadata as a bounded
+backup once caller audio exists, removes the old 30-second greeting fallback,
+and closes SDK playback immediately on bridge disconnect. Full suite: **192
+passed**. A delayed-ready real LiveKit test remained silent while warming and
+started greeting **0.623 seconds** after readiness; stop/video/two label checks
+passed. These are integration results, not measured handset-answer latency.
+
 The worker now shows listening, thinking and speaking states and gives brief
 spoken feedback when a caller interrupts. The existing website uses the same
 Higgsfield-generated character. No avatar-generation API runs during a call.

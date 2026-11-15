@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -8,7 +9,7 @@ from collections import deque
 from uuid import uuid4, UUID
 
 from dotenv import load_dotenv
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import AgentServer, AutoSubscribe, JobContext, StopResponse, cli
 from livekit.agents.voice import Agent, AgentSession, room_io
 from livekit.plugins import elevenlabs, silero
@@ -38,6 +39,14 @@ settings = Settings()
 AGENT_NAME = os.environ.get("AGENT_NAME", settings.agent_name)
 server = AgentServer()
 _VAD = silero.VAD.load()
+
+
+def _bridge_metadata_ready(metadata: str) -> bool:
+    try:
+        value=json.loads(metadata or '{}')
+    except (TypeError,ValueError):
+        return metadata=='chert_bridge_ready'  # Legacy marker.
+    return isinstance(value,dict) and value.get('chert_bridge_ready') is True
 
 
 class TiresiasAgent(Agent):
@@ -178,6 +187,9 @@ async def entrypoint(ctx: JobContext) -> None:
     profile_entry=ProfileCodeEntry()
     caller_task=None
     avatar_task=None
+    greeting_task=None
+    warm_task=None
+    caller_audio_ready=asyncio.Event()
     caller_resolved=asyncio.Event()
     controller.speed=voice_state['preferences'].speed
     call_id=str(uuid4())
@@ -610,6 +622,8 @@ async def entrypoint(ctx: JobContext) -> None:
         if name == CALLER_AUDIO_TRACK or track.kind == rtc.TrackKind.KIND_AUDIO:
             lifecycle.on_caller_audio(epoch)
             feedback.connect()
+            if name == CALLER_AUDIO_TRACK and participant.identity.startswith('chert-bridge'):
+                caller_audio_ready.set()
             logger.info("caller audio track ready")
 
     ctx.room.on("track_subscribed", _on_track)
@@ -622,6 +636,10 @@ async def entrypoint(ctx: JobContext) -> None:
         feedback.close()
         if avatar_task:
             avatar_task.cancel()
+        if greeting_task:
+            greeting_task.cancel()
+        if warm_task:
+            warm_task.cancel()
         for video_task in tuple(video_tasks):
             video_task.cancel()
         buffer.clear()
@@ -634,6 +652,15 @@ async def entrypoint(ctx: JobContext) -> None:
         asyncio.create_task(telemetry.close())
 
     ctx.room.on("disconnected", _on_disconnect)
+
+    def _on_bridge_disconnect(participant):
+        if (participant.identity or '').startswith('chert-bridge') and not voice_state['closed']:
+            _on_disconnect()
+            # Cancelling say() awaiters does not stop SDK-owned playback.
+            # Transport failures are not all covered by RoomIO's auto-close.
+            session.shutdown(drain=False)
+
+    ctx.room.on('participant_disconnected',_on_bridge_disconnect)
 
     @session.on('close')
     def _on_session_close(ev):
@@ -650,13 +677,32 @@ async def entrypoint(ctx: JobContext) -> None:
             await asyncio.to_thread(warm)
         except Exception as error:
             logger.warning('Vision client warmup failed: %s',type(error).__name__)
-    asyncio.create_task(warm_vision())
+    warm_task=asyncio.create_task(warm_vision())
 
     async def wait_bridge_ready() -> None:
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            meta = ctx.room.metadata or ""
-            if "chert_bridge_ready" in meta:
+        next_probe=0.0
+        probe_warning=False
+        while not voice_state['closed']:
+            ready=_bridge_metadata_ready(ctx.room.metadata)
+            # Chert requires its explicit media-ready flag. Read the server's
+            # metadata as a backup when RTC's local room state has not updated.
+            # Caller track arrival enables probing, but never authorizes speech.
+            if not ready and caller_audio_ready.is_set() and time.monotonic()>=next_probe:
+                next_probe=time.monotonic()+0.75
+                try:
+                    client=getattr(ctx,'api',None)
+                    if client is not None:
+                        rooms=await asyncio.wait_for(client.room.list_rooms(
+                            api.ListRoomsRequest(names=[ctx.room.name])),2)
+                        ready=any(room.name==ctx.room.name and _bridge_metadata_ready(room.metadata)
+                                  for room in rooms.rooms)
+                        if ready:
+                            logger.info('Bridge readiness confirmed through room service')
+                except Exception as error:
+                    if not probe_warning:
+                        logger.warning('Bridge readiness lookup unavailable: %s',type(error).__name__)
+                        probe_warning=True
+            if ready:
                 if voice_state['closed']:
                     return
                 feedback.connect()
@@ -670,12 +716,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     await speak(greeting, interruptible=False)
                 return
             await asyncio.sleep(0.1)
-        greeting = lifecycle.on_bridge_ready(epoch)
-        if voice_state['closed']:
-            return
-        feedback.connect()
-        if greeting and not lifecycle.transcripts:
-            await speak(greeting, interruptible=False)
 
     agent=TiresiasAgent(handle_user_text)
 
@@ -709,7 +749,7 @@ async def entrypoint(ctx: JobContext) -> None:
         for publication in participant.track_publications.values():
             if publication.track is not None:
                 _on_track(publication.track, publication, participant)
-    asyncio.create_task(wait_bridge_ready())
+    greeting_task=asyncio.create_task(wait_bridge_ready())
     try:
         avatar_task=await _publish_status_video(ctx,feedback)
         if voice_state['closed'] and avatar_task:

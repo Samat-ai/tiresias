@@ -31,6 +31,7 @@ class FakeSession:
         self.messages = asyncio.Queue()
         self.tts = kwargs['tts']
         self.interruptions = 0
+        self.shutdown_calls=[]
 
     def on(self, name):
         def register(handler):
@@ -47,13 +48,16 @@ class FakeSession:
     async def interrupt(self, **kwargs):
         self.interruptions += 1
 
+    def shutdown(self, *, drain=True):
+        self.shutdown_calls.append(drain)
+
     async def transcript(self, text):
         self.handlers['user_input_transcribed'](SimpleNamespace(transcript=text, is_final=True))
         with pytest.raises(runtime.StopResponse):
             await self.agent.on_user_turn_completed(None, SimpleNamespace(text_content=text))
 
 
-async def setup_call(monkeypatch, vision, *, caller_links=False, bridge_ready=True):
+async def setup_call(monkeypatch, vision, *, caller_links=False, bridge_ready=True, room_service=None):
     session = FakeSession(tts=SimpleNamespace(update_options=lambda **kwargs: None))
     frames = FrameBuffer('test')
     def make_session(**kwargs):
@@ -78,7 +82,8 @@ async def setup_call(monkeypatch, vision, *, caller_links=False, bridge_ready=Tr
     room=FakeRoom()
     if not bridge_ready:
         room.metadata=''
-    await runtime.entrypoint(SimpleNamespace(room=room, connect=nothing))
+    await runtime.entrypoint(SimpleNamespace(room=room, connect=nothing,
+        api=SimpleNamespace(room=room_service) if room_service else None))
     # Allow the bridge-ready greeting task to finish.
     if bridge_ready:
         assert 'Tiresias' in await asyncio.wait_for(session.messages.get(), 1)
@@ -541,3 +546,58 @@ async def test_caller_audio_reaches_stt_during_the_first_seconds_of_greeting(mon
         assert bytes(pushed[0].data)==bytes(frame.data)
     finally:
         sdk._aec_warmup_timer.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('initial_metadata',['{}','{"chert_bridge_ready":false}'])
+async def test_warm_room_waits_for_real_ready_signal_after_caller_audio(monkeypatch,initial_metadata):
+    session,_=await setup_call(monkeypatch,None,bridge_ready=False)
+    session.room.metadata=initial_metadata
+    session.room.handlers['track_subscribed'](
+        SimpleNamespace(kind=runtime.rtc.TrackKind.KIND_AUDIO),
+        SimpleNamespace(name=runtime.CALLER_AUDIO_TRACK),
+        SimpleNamespace(identity='chert-bridge-test'))
+    await asyncio.sleep(0.3)
+    assert session.messages.empty()
+    session.room.metadata='{"chert_bridge_ready":true}'
+    assert 'Tiresias' in await asyncio.wait_for(session.messages.get(),1)
+    session.room.handlers['disconnected']()
+
+
+@pytest.mark.asyncio
+async def test_bridge_disconnect_cancels_pending_greeting(monkeypatch):
+    session,_=await setup_call(monkeypatch,None,bridge_ready=False)
+    handler=session.room.handlers.get('participant_disconnected')
+    assert handler is not None
+    handler(SimpleNamespace(identity='chert-bridge-test'))
+    session.room.metadata='chert_bridge_ready'
+    await asyncio.sleep(0.3)
+    assert session.messages.empty()
+
+
+@pytest.mark.asyncio
+async def test_server_metadata_readiness_recovers_a_stale_rtc_room(monkeypatch):
+    ready=False
+    async def list_rooms(request):
+        assert list(request.names)==['test-room']
+        return SimpleNamespace(rooms=[SimpleNamespace(name='test-room',
+            metadata='{"chert_bridge_ready":true}' if ready else '{"chert_warm":true}')])
+    session,_=await setup_call(monkeypatch,None,bridge_ready=False,
+                             room_service=SimpleNamespace(list_rooms=list_rooms))
+    session.room.handlers['track_subscribed'](
+        SimpleNamespace(kind=runtime.rtc.TrackKind.KIND_AUDIO),
+        SimpleNamespace(name=runtime.CALLER_AUDIO_TRACK),
+        SimpleNamespace(identity='chert-bridge-test'))
+    await asyncio.sleep(0.3)
+    assert session.messages.empty()
+    ready=True
+    assert 'Tiresias' in await asyncio.wait_for(session.messages.get(),2)
+    session.room.handlers['disconnected']()
+
+
+@pytest.mark.asyncio
+async def test_bridge_transport_failure_shuts_down_sdk_without_draining_audio(monkeypatch):
+    session,_=await setup_call(monkeypatch,None)
+    session.room.handlers['participant_disconnected'](
+        SimpleNamespace(identity='chert-bridge-test',disconnect_reason='CONNECTION_TIMEOUT'))
+    assert session.shutdown_calls==[False]
