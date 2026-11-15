@@ -47,6 +47,30 @@ async def test_response_waits_until_caller_stops_speaking():
     await asyncio.wait_for(waiting, 0.5)
 
 
+@pytest.mark.asyncio
+async def test_stuck_speech_detector_cannot_hold_an_answer_indefinitely():
+    gate = QuietGate(quiet_period=0)
+    gate.set_speaking(True)
+    assert await asyncio.wait_for(gate.wait(max_wait=0.03), 0.2) is False
+    # Releasing one answer must not manufacture silence for status cues.
+    waiting = asyncio.create_task(gate.wait())
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    gate.set_speaking(False)
+    assert await asyncio.wait_for(waiting, 0.2) is True
+
+
+@pytest.mark.asyncio
+async def test_bounded_speech_gate_still_honors_real_silence():
+    gate = QuietGate(quiet_period=0)
+    gate.set_speaking(True)
+    waiting = asyncio.create_task(gate.wait(max_wait=0.2))
+    await asyncio.sleep(0.01)
+    assert not waiting.done()
+    gate.set_speaking(False)
+    assert await waiting is True
+
+
 def test_visual_question_uses_current_image_and_recent_question_in_one_request():
     calls = []
     vision = VisionClient.__new__(VisionClient)

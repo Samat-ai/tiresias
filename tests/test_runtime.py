@@ -182,6 +182,20 @@ async def test_conversational_answer_waits_for_caller_silence(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ready_answer_is_not_stranded_by_continuous_background_speech(monkeypatch):
+    from tiresias.contracts import GroundedReply
+
+    def answer(frame, question, history, **kwargs):
+        return GroundedReply(text='I see two Pepsi cans.', frame_id=frame.frame_id)
+
+    session, frames = await setup_call(monkeypatch, SimpleNamespace(answer_question=answer))
+    push(frames)
+    session.handlers['user_state_changed'](SimpleNamespace(new_state='speaking'))
+    await session.transcript('How many Pepsi cans can you see?')
+    assert await asyncio.wait_for(session.messages.get(), 2) == 'I see two Pepsi cans.'
+
+
+@pytest.mark.asyncio
 async def test_voice_change_applies_without_calling_vision(monkeypatch):
     session, frames=await setup_call(monkeypatch,None)
     updates=[]

@@ -245,7 +245,14 @@ async def entrypoint(ctx: JobContext) -> None:
         try:
             if not status_cue:
                 await feedback.before_answer()
-                await quiet.wait()
+                # Continuous background voices can keep SDK user_state in
+                # 'speaking' after STT has completed the caller's request.
+                # A ready response must not wait indefinitely on that signal.
+                gate_started=time.monotonic()
+                silent=await quiet.wait(max_wait=1.2)
+                measure('response_silence_wait',gate_started,'ok' if silent else 'vad_timeout')
+                if not silent:
+                    logger.info('Ready response released after bounded VAD silence wait')
             started=time.monotonic()
             if answer:
                 response_audio_clock['ready']=True

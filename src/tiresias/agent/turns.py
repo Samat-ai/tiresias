@@ -23,12 +23,21 @@ class QuietGate:
         else:
             self._quiet.set()
 
-    async def wait(self) -> None:
-        while True:
-            await self._quiet.wait()
-            await asyncio.sleep(self.quiet_period)
-            if self._quiet.is_set():
-                return
+    async def wait(self, *, max_wait: float | None = None) -> bool:
+        """Return whether silence arrived; optionally bound a noisy VAD hold.
+
+        The timeout releases this waiter only. Status cues continue to require
+        real silence, and future caller turns still cancel pending answers.
+        """
+        try:
+            async with asyncio.timeout(max_wait):
+                while True:
+                    await self._quiet.wait()
+                    await asyncio.sleep(self.quiet_period)
+                    if self._quiet.is_set():
+                        return True
+        except TimeoutError:
+            return False
 
 
 class LatestTurn:

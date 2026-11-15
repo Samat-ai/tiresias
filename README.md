@@ -69,7 +69,7 @@ Say “Stop,” “Wait,” or “Repeat” to control the conversation. Calls s
 
 **Verified deployment:** The HTTPS website, LiveKit worker and Chert connector run on Vultr under persistent systemd services. The operator’s laptop can be off. Opening the website alone does not start a FaceTime call. Deployment and service operations are described in [Persistent cloud calling](deploy/CALL-HOSTING.md).
 
-**Recorded evidence:** 233 passing tests, real provider media tests, and owner-confirmed handset label reading and caller-linked settings. See [verification and limits](#verification-and-limits) for scope.
+**Recorded evidence:** 236 passing tests, real provider media tests, and owner-confirmed handset label reading and caller-linked settings. See [verification and limits](#verification-and-limits) for scope.
 
 <details>
 <summary><b>See the real mobile website</b></summary>
@@ -183,7 +183,7 @@ Wait for readiness, then FaceTime Video the number provisioned to your Chert acc
 
 ## Verification and limits
 
-The recorded full-suite baseline is **233 passing tests**. Real isolated LiveKit tests exercised ElevenLabs STT, Vertex vision, returned TTS, animated video, repeated label reads and interruption. One delayed-ready test stayed silent before bridge readiness and began audio **0.623 seconds after readiness**. That excludes total FaceTime call setup and handset latency.
+The recorded full-suite baseline is **236 passing tests**. Real isolated LiveKit tests exercised ElevenLabs STT, Vertex vision, returned TTS, animated video, repeated label reads and interruption. One delayed-ready test stayed silent before bridge readiness and began audio **0.623 seconds after readiness**. That excludes total FaceTime call setup and handset latency.
 
 Real Vertex checks verified that an incidental foreign-language question still receives an English answer, an explicit Russian request switches replies to Russian, and an explicit English request switches back. Regression tests cover common noise, incomplete fragments and conversation controls. The owner separately used a real FaceTime handset and confirmed label recognition and caller-linked preferences. The final cloud worker passed a real provider call test with two visual answers, early-stop feedback and changing avatar video. The connector is authenticated and agent-warm with no laptop call processes running. The latest changes still need the final handset recording.
 
